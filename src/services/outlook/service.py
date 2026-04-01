@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 
 
 # 默认提供者优先级
-# IMAP_OLD 最兼容（只需 login.live.com token），IMAP_NEW 次之，Graph API 最后
-# 原因：部分 client_id 没有 Graph API 权限，但有 IMAP 权限
+# Graph API 优先：个人 Outlook.com 账户的 IMAP OAuth scope 受限，Graph API 更可靠
+# IMAP_OLD 作为备用（某些组织账户可能仅支持 IMAP）
 DEFAULT_PROVIDER_PRIORITY = [
-    ProviderType.IMAP_OLD,
-    ProviderType.IMAP_NEW,
     ProviderType.GRAPH_API,
+    ProviderType.IMAP_NEW,
+    ProviderType.IMAP_OLD,
 ]
 
 # OTP 发送时间的容忍偏差（秒）
@@ -224,6 +224,7 @@ class OutlookService(BaseEmailService):
             邮件列表
         """
         errors = []
+        had_successful_connection = False
 
         # 根据账户类型选择合适的提供者优先级
         priority = self._get_provider_priority_for_account(account)
@@ -242,15 +243,30 @@ class OutlookService(BaseEmailService):
 
                 with self._imap_semaphore:
                     with provider:
+                        had_successful_connection = True
                         emails = provider.get_recent_emails(count, only_unseen)
 
+                        # 连接成功，记录健康状态（即使没有邮件也算成功连接）
+                        self.health_checker.record_success(provider_type)
+
                         if emails:
-                            # 成功获取邮件
-                            self.health_checker.record_success(provider_type)
                             logger.debug(
                                 f"[{account.email}] {provider_type.value} 获取到 {len(emails)} 封邮件"
                             )
                             return emails
+                        else:
+                            logger.debug(
+                                f"[{account.email}] {provider_type.value} 连接成功但无匹配邮件"
+                            )
+                            return []
+
+            except ConnectionError as e:
+                error_msg = str(e)
+                errors.append(f"{provider_type.value}: {error_msg}")
+                self.health_checker.record_failure(provider_type, error_msg)
+                logger.warning(
+                    f"[{account.email}] {provider_type.value} 连接失败: {e}"
+                )
 
             except Exception as e:
                 error_msg = str(e)
@@ -260,9 +276,14 @@ class OutlookService(BaseEmailService):
                     f"[{account.email}] {provider_type.value} 获取邮件失败: {e}"
                 )
 
-        logger.error(
-            f"[{account.email}] 所有提供者都失败: {'; '.join(errors)}"
-        )
+        if errors:
+            error_detail = '; '.join(errors)
+            logger.error(
+                f"[{account.email}] 所有提供者都失败: {error_detail}"
+            )
+            # 抛出异常让上层感知连接失败（而不是静默返回空列表）
+            raise EmailServiceError(f"邮箱连接失败: {error_detail}")
+
         return []
 
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -365,6 +386,9 @@ class OutlookService(BaseEmailService):
 
         start_time = time.time()
         poll_count = 0
+        consecutive_conn_failures = 0
+        max_conn_failures = 5  # 连续连接失败超过此次数则提前终止
+        last_conn_error = ""
 
         while time.time() - start_time < actual_timeout:
             poll_count += 1
@@ -379,6 +403,9 @@ class OutlookService(BaseEmailService):
                     count=15,
                     only_unseen=only_unseen,
                 )
+
+                # 连接成功，重置连接失败计数
+                consecutive_conn_failures = 0
 
                 if emails:
                     logger.debug(
@@ -401,6 +428,27 @@ class OutlookService(BaseEmailService):
                         )
                         self.update_status(True)
                         return code
+
+            except EmailServiceError as e:
+                consecutive_conn_failures += 1
+                last_conn_error = str(e)
+                logger.warning(
+                    f"[{email}] 第 {poll_count} 次轮询连接失败 "
+                    f"(连续 {consecutive_conn_failures} 次): {e}"
+                )
+
+                # 连续连接失败超过阈值，提前终止并抛出异常
+                if consecutive_conn_failures >= max_conn_failures:
+                    logger.error(
+                        f"[{email}] 连续 {consecutive_conn_failures} 次连接失败，"
+                        f"终止验证码获取: {last_conn_error}"
+                    )
+                    self.update_status(False, EmailServiceError(last_conn_error))
+                    raise EmailServiceError(
+                        f"邮箱 IMAP 连接持续失败，无法获取验证码。"
+                        f"请检查邮箱密码是否正确，或配置 OAuth2 (client_id + refresh_token)。"
+                        f"错误详情: {last_conn_error}"
+                    )
 
             except Exception as e:
                 logger.warning(f"[{email}] 检查出错: {e}")

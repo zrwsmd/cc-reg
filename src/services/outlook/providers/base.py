@@ -164,7 +164,10 @@ class OutlookProvider(abc.ABC):
 
     def __enter__(self):
         """上下文管理器入口"""
-        self.connect()
+        if not self.connect():
+            raise ConnectionError(
+                f"{self.provider_type.value} 连接失败，请检查账户认证配置"
+            )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

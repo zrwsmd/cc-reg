@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 # 各提供者的 Scope 配置
 PROVIDER_SCOPES = {
-    ProviderType.IMAP_OLD: "",  # 旧版 IMAP 不需要特定 scope
+    ProviderType.IMAP_OLD: "",  # live.com 端点不需要 scope
     ProviderType.IMAP_NEW: "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
-    ProviderType.GRAPH_API: "https://graph.microsoft.com/.default",
+    ProviderType.GRAPH_API: "https://graph.microsoft.com/Mail.Read offline_access",
 }
 
 # 各提供者的 Token 端点

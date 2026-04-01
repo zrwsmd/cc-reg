@@ -5,12 +5,16 @@
 
 import email
 import imaplib
+import json
 import logging
+import time
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from typing import List, Optional
 
-from ..base import ProviderType, EmailMessage
+from curl_cffi import requests as _requests
+
+from ..base import ProviderType, TokenEndpoint, TokenInfo, EmailMessage
 from ..account import OutlookAccount
 from ..token_manager import TokenManager
 from .base import OutlookProvider, ProviderConfig
@@ -95,11 +99,26 @@ class IMAPOldProvider(OutlookProvider):
 
             # 密码认证
             if self.account.password:
-                self._conn.login(self.account.email, self.account.password)
-                self._connected = True
-                self.record_success()
-                logger.info(f"[{self.account.email}] IMAP 连接成功 (密码认证)")
-                return True
+                try:
+                    self._conn.login(self.account.email, self.account.password)
+                    self._connected = True
+                    self.record_success()
+                    logger.info(f"[{self.account.email}] IMAP 连接成功 (密码认证)")
+                    return True
+                except Exception as login_err:
+                    error_str = str(login_err)
+                    # 如果是 BasicAuthBlocked，尝试 ROPC OAuth2 降级
+                    if "BasicAuthBlocked" in error_str or "LOGIN failed" in error_str:
+                        logger.warning(
+                            f"[{self.account.email}] 密码认证被拒绝 (BasicAuthBlocked)，"
+                            f"尝试 ROPC OAuth2 降级..."
+                        )
+                        if self._try_ropc_oauth2():
+                            return True
+                        else:
+                            raise login_err
+                    else:
+                        raise login_err
 
             raise ValueError("没有可用的认证方式")
 
@@ -108,6 +127,138 @@ class IMAPOldProvider(OutlookProvider):
             self.record_failure(str(e))
             logger.error(f"[{self.account.email}] IMAP 连接失败: {e}")
             return False
+
+    # ROPC 降级使用的已知 Microsoft 公共 client_id
+    ROPC_CLIENT_IDS = [
+        "9e5f94bc-e8a4-4e73-b8be-63364c29d753",  # Thunderbird
+        "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
+        "1fec8e78-bce4-4aaf-ab1b-5451cc387264",  # Microsoft Teams
+    ]
+    # ROPC 的 IMAP scope
+    ROPC_IMAP_SCOPE = "https://outlook.office365.com/IMAP.AccessAsUser.All offline_access"
+    # ROPC Token 端点（consumer 账户）
+    ROPC_TOKEN_URLS = [
+        TokenEndpoint.CONSUMERS.value,
+        TokenEndpoint.COMMON.value,
+    ]
+
+    def _try_ropc_oauth2(self) -> bool:
+        """
+        使用 ROPC (Resource Owner Password Credentials) 流程获取 OAuth2 Token，
+        然后用 XOAUTH2 认证 IMAP。
+        当密码认证被 Microsoft 拒绝 (BasicAuthBlocked) 时自动降级调用。
+
+        Returns:
+            是否认证成功
+        """
+        if not self.account.password:
+            return False
+
+        proxies = None
+        if self.config.proxy_url:
+            proxies = {"http": self.config.proxy_url, "https": self.config.proxy_url}
+
+        for token_url in self.ROPC_TOKEN_URLS:
+            for client_id in self.ROPC_CLIENT_IDS:
+                try:
+                    token = self._ropc_get_token(token_url, client_id, proxies)
+                    if not token:
+                        continue
+
+                    # 需要重新创建 IMAP 连接（之前的连接可能已失效）
+                    self.disconnect()
+                    self._conn = imaplib.IMAP4_SSL(
+                        self.IMAP_HOST,
+                        self.IMAP_PORT,
+                        timeout=self.config.timeout,
+                    )
+
+                    # 使用 XOAUTH2 认证
+                    auth_string = (
+                        f"user={self.account.email}\x01"
+                        f"auth=Bearer {token.access_token}\x01\x01"
+                    )
+                    self._conn.authenticate(
+                        "XOAUTH2",
+                        lambda _: auth_string.encode("utf-8"),
+                    )
+                    self._connected = True
+                    self.record_success()
+                    logger.info(
+                        f"[{self.account.email}] IMAP 连接成功 "
+                        f"(ROPC OAuth2 降级, client={client_id[:8]}...)"
+                    )
+                    return True
+
+                except Exception as e:
+                    logger.debug(
+                        f"[{self.account.email}] ROPC 尝试失败 "
+                        f"(url={token_url.split('/')[-3]}, client={client_id[:8]}...): {e}"
+                    )
+                    continue
+
+        logger.warning(
+            f"[{self.account.email}] 所有 ROPC 降级尝试均失败，"
+            f"请配置 OAuth2 (client_id + refresh_token)"
+        )
+        return False
+
+    def _ropc_get_token(
+        self,
+        token_url: str,
+        client_id: str,
+        proxies: Optional[dict] = None,
+    ) -> Optional[TokenInfo]:
+        """
+        通过 ROPC 流程获取 access token
+
+        Args:
+            token_url: Token 端点 URL
+            client_id: 客户端 ID
+            proxies: 代理配置
+
+        Returns:
+            TokenInfo 或 None
+        """
+        data = {
+            "grant_type": "password",
+            "client_id": client_id,
+            "username": self.account.email,
+            "password": self.account.password,
+            "scope": self.ROPC_IMAP_SCOPE,
+        }
+
+        try:
+            resp = _requests.post(
+                token_url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+                proxies=proxies,
+                timeout=self.config.timeout,
+                impersonate="chrome110",
+            )
+
+            if resp.status_code != 200:
+                error_body = resp.text[:200]
+                logger.debug(
+                    f"[{self.account.email}] ROPC token 请求失败: "
+                    f"HTTP {resp.status_code}, {error_body}"
+                )
+                return None
+
+            token = TokenInfo.from_response(resp.json(), self.ROPC_IMAP_SCOPE)
+            logger.debug(
+                f"[{self.account.email}] ROPC token 获取成功 "
+                f"(有效期 {int(token.expires_at - time.time())}s)"
+            )
+            return token
+
+        except Exception as e:
+            logger.debug(f"[{self.account.email}] ROPC 请求异常: {e}")
+            return None
 
     def _authenticate_xoauth2(self) -> bool:
         """
@@ -190,6 +341,10 @@ class IMAPOldProvider(OutlookProvider):
                         continue
 
                     ids = data[0].split()
+                    logger.info(
+                        f"[{self.account.email}] 文件夹 {mailbox}: "
+                        f"找到 {len(ids)} 封邮件 (flag={flag})"
+                    )
                     recent_ids = ids[-count:][::-1]  # 倒序，最新的在前
 
                     for msg_id in recent_ids:
@@ -211,6 +366,15 @@ class IMAPOldProvider(OutlookProvider):
                 except Exception as e:
                     logger.debug(f"[{self.account.email}] 跳过邮箱文件夹 {mailbox}: {e}")
 
+            if emails:
+                logger.info(
+                    f"[{self.account.email}] 共获取到 {len(emails)} 封邮件, "
+                    f"发件人: {[e.sender[:40] for e in emails[:5]]}"
+                )
+            else:
+                logger.info(
+                    f"[{self.account.email}] 未获取到任何邮件 (flag={flag})"
+                )
             return emails
 
         except Exception as e:
