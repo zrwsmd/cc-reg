@@ -1,3 +1,6 @@
+from datetime import datetime
+from types import SimpleNamespace
+
 from src.core.upload import cpa_upload
 
 
@@ -19,6 +22,71 @@ class FakeMime:
 
     def addpart(self, **kwargs):
         self.parts.append(kwargs)
+
+
+def make_account(**overrides):
+    data = {
+        "email": "tester@example.com",
+        "expires_at": datetime(2026, 6, 1, 12, 0, 0),
+        "id_token": "",
+        "account_id": "acct-123",
+        "workspace_id": "ws-456",
+        "access_token": "access-token",
+        "last_refresh": datetime(2026, 4, 1, 8, 0, 0),
+        "refresh_token": "refresh-token",
+        "subscription_type": "plus",
+    }
+    data.update(overrides)
+    return SimpleNamespace(**data)
+
+
+def test_generate_token_json_backfills_codex_id_token_when_missing():
+    token_data = cpa_upload.generate_token_json(make_account())
+
+    assert token_data["account_id"] == "acct-123"
+    assert token_data["chatgpt_account_id"] == "acct-123"
+    assert token_data["workspace_id"] == "ws-456"
+    assert token_data["plan_type"] == "plus"
+
+    assert token_data["id_token"].count(".") == 2
+    id_token_payload = cpa_upload._decode_jwt_payload(token_data["id_token"])
+    auth_claim = id_token_payload["https://api.openai.com/auth"]
+    assert auth_claim["chatgpt_account_id"] == "acct-123"
+    assert auth_claim["workspace_id"] == "ws-456"
+    assert auth_claim["chatgpt_plan_type"] == "plus"
+
+
+def test_generate_token_json_preserves_existing_id_token():
+    existing_id_token = ".".join(
+        [
+            cpa_upload._base64url_encode_json({"alg": "none", "typ": "JWT"}),
+            cpa_upload._base64url_encode_json(
+                {
+                    "email": "tester@example.com",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acct-from-token",
+                        "chatgpt_plan_type": "team",
+                    },
+                }
+            ),
+            "signature",
+        ]
+    )
+
+    token_data = cpa_upload.generate_token_json(
+        make_account(
+            id_token=existing_id_token,
+            account_id="",
+            workspace_id="",
+            subscription_type="",
+        )
+    )
+
+    assert token_data["id_token"] == existing_id_token
+    assert token_data["account_id"] == "acct-from-token"
+    assert token_data["chatgpt_account_id"] == "acct-from-token"
+    assert token_data["workspace_id"] == "acct-from-token"
+    assert token_data["plan_type"] == "team"
 
 
 def test_upload_to_cpa_accepts_management_root_url(monkeypatch):

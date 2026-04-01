@@ -2,6 +2,7 @@
 CPA (Codex Protocol API) 上传功能
 """
 
+import base64
 import json
 import logging
 from typing import List, Dict, Any, Tuple, Optional
@@ -16,6 +17,169 @@ from ...database.models import Account
 from ...config.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_jwt_payload(token: Optional[str]) -> Dict[str, Any]:
+    if not token or not isinstance(token, str):
+        return {}
+
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+
+    try:
+        decoded = base64.urlsafe_b64decode(payload + padding).decode("utf-8")
+        parsed = json.loads(decoded)
+    except Exception:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _base64url_encode_json(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _parse_json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+
+    if not isinstance(value, str):
+        return {}
+
+    text = value.strip()
+    if not text:
+        return {}
+
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_auth_claim(payload: Dict[str, Any]) -> Dict[str, Any]:
+    auth = payload.get("https://api.openai.com/auth")
+    if isinstance(auth, dict):
+        return auth
+
+    auth = payload.get("auth_data")
+    if isinstance(auth, dict):
+        return auth
+
+    return {}
+
+
+def _extract_chatgpt_account_id_from_token(token: Optional[str]) -> str:
+    payload = _parse_json_object(token) or _decode_jwt_payload(token)
+    if not payload:
+        return ""
+
+    auth = _extract_auth_claim(payload)
+    for key in ("chatgpt_account_id", "chatgptAccountId", "account_id", "workspace_id"):
+        value = str(auth.get(key) or payload.get(key) or "").strip()
+        if value:
+            return value
+
+    return ""
+
+
+def _extract_plan_type_from_token(token: Optional[str]) -> str:
+    payload = _parse_json_object(token) or _decode_jwt_payload(token)
+    if not payload:
+        return ""
+
+    auth = _extract_auth_claim(payload)
+    for key in ("plan_type", "planType", "chatgpt_plan_type", "subscription_plan", "subscription_tier"):
+        value = str(auth.get(key) or payload.get(key) or "").strip()
+        if value:
+            return value
+
+    return ""
+
+
+def _is_jwt_token(token: Optional[str]) -> bool:
+    token_text = str(token or "").strip()
+    return token_text.count(".") == 2 and bool(_decode_jwt_payload(token_text))
+
+
+def _resolve_chatgpt_account_id(account: Account) -> str:
+    for candidate in (
+        getattr(account, "account_id", None),
+        _extract_chatgpt_account_id_from_token(getattr(account, "id_token", None)),
+        _extract_chatgpt_account_id_from_token(getattr(account, "access_token", None)),
+        getattr(account, "workspace_id", None),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+
+    return ""
+
+
+def _resolve_plan_type(account: Account) -> str:
+    for candidate in (
+        getattr(account, "subscription_type", None),
+        _extract_plan_type_from_token(getattr(account, "id_token", None)),
+        _extract_plan_type_from_token(getattr(account, "access_token", None)),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+
+    return ""
+
+
+def _build_export_id_token(account: Account, chatgpt_account_id: str, workspace_id: str, plan_type: str) -> str:
+    raw_id_token = str(getattr(account, "id_token", "") or "").strip()
+    if raw_id_token and _is_jwt_token(raw_id_token):
+        return raw_id_token
+
+    synthetic_auth_claim: Dict[str, Any] = {}
+    if chatgpt_account_id:
+        synthetic_auth_claim["chatgpt_account_id"] = chatgpt_account_id
+        synthetic_auth_claim["chatgpt_user_id"] = chatgpt_account_id
+        synthetic_auth_claim["user_id"] = chatgpt_account_id
+    if workspace_id:
+        synthetic_auth_claim["workspace_id"] = workspace_id
+        synthetic_auth_claim["organizations"] = [
+            {
+                "id": workspace_id,
+                "is_default": True,
+                "role": "owner",
+                "title": "Default",
+            }
+        ]
+    if plan_type:
+        synthetic_auth_claim["chatgpt_plan_type"] = plan_type
+
+    if not synthetic_auth_claim:
+        return ""
+
+    now_ts = int(datetime.utcnow().timestamp())
+    payload: Dict[str, Any] = {
+        "iss": "https://auth.openai.com",
+        "aud": ["codex-cli"],
+        "iat": now_ts,
+        "exp": now_ts + 86400 * 365,
+        "email": str(getattr(account, "email", "") or "").strip(),
+        "sub": chatgpt_account_id or workspace_id or str(getattr(account, "email", "") or "").strip(),
+        "https://api.openai.com/auth": synthetic_auth_claim,
+    }
+    header = {"alg": "none", "typ": "JWT"}
+
+    return ".".join(
+        (
+            _base64url_encode_json(header),
+            _base64url_encode_json(payload),
+            "cli-proxy-api",
+        )
+    )
 
 
 def _normalize_cpa_auth_files_url(api_url: str) -> str:
@@ -113,12 +277,20 @@ def generate_token_json(account: Account) -> dict:
     Returns:
         CPA 格式的 Token 字典
     """
+    chatgpt_account_id = _resolve_chatgpt_account_id(account)
+    workspace_id = str(getattr(account, "workspace_id", "") or chatgpt_account_id or "").strip()
+    plan_type = _resolve_plan_type(account)
+    export_id_token = _build_export_id_token(account, chatgpt_account_id, workspace_id, plan_type)
+
     return {
         "type": "codex",
         "email": account.email,
         "expired": account.expires_at.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.expires_at else "",
-        "id_token": account.id_token or "",
-        "account_id": account.account_id or "",
+        "id_token": export_id_token,
+        "account_id": chatgpt_account_id,
+        "chatgpt_account_id": chatgpt_account_id,
+        "workspace_id": workspace_id,
+        "plan_type": plan_type,
         "access_token": account.access_token or "",
         "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.last_refresh else "",
         "refresh_token": account.refresh_token or "",
