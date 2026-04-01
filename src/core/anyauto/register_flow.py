@@ -414,6 +414,30 @@ class AnyAutoRegistrationEngine:
                     if oauth_client.last_error and "add_phone" in oauth_client.last_error:
                         break
 
+                # 密码登录失败时，尝试 passwordless OTP 登录
+                if not (tokens and tokens.get("access_token")):
+                    pw_err = str(getattr(oauth_client, "last_error", "") or "")
+                    if "add_phone" not in pw_err:
+                        self._log("密码登录失败，尝试 Passwordless OTP 登录...")
+                        oauth_client2 = OAuthClient(
+                            config=oauth_config,
+                            proxy=self.proxy_url,
+                            verbose=False,
+                            browser_mode=self.browser_mode,
+                        )
+                        oauth_client2._log = self._log
+                        oauth_client2.session = chatgpt_client.session
+                        tokens = oauth_client2.login_passwordless_and_get_tokens(
+                            normalized_email,
+                            chatgpt_client.device_id,
+                            chatgpt_client.ua,
+                            chatgpt_client.sec_ch_ua,
+                            chatgpt_client.impersonate,
+                            skymail_adapter,
+                        )
+                        if tokens and tokens.get("access_token"):
+                            oauth_client = oauth_client2
+
                 if tokens and tokens.get("access_token"):
                     self._log("OAuth 回退补全成功！")
                     workspace_id = ""
