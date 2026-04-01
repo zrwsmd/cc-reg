@@ -253,8 +253,16 @@ class AnyAutoRegistrationEngine:
 
         oauth_config = dict(self.extra_config or {})
         if not oauth_config:
+            # openai_auth_url 是完整授权端点（如 .../oauth/authorize），oauth_issuer 只需要 origin
+            _auth_url = str(getattr(settings, "openai_auth_url", "") or "").strip()
+            if _auth_url:
+                from urllib.parse import urlparse as _urlparse
+                _p = _urlparse(_auth_url)
+                _issuer = f"{_p.scheme}://{_p.netloc}" if _p.scheme and _p.netloc else "https://auth.openai.com"
+            else:
+                _issuer = "https://auth.openai.com"
             oauth_config = {
-                "oauth_issuer": str(getattr(settings, "openai_auth_url", "") or "https://auth.openai.com"),
+                "oauth_issuer": _issuer,
                 "oauth_client_id": str(getattr(settings, "openai_client_id", "") or "app_EMoamEEZ73f0CkXaXp7hrann"),
                 "oauth_redirect_uri": str(getattr(settings, "openai_redirect_uri", "") or "http://localhost:1455/auth/callback"),
             }
