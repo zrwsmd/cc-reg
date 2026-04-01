@@ -6,7 +6,7 @@ import json
 import logging
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from curl_cffi import requests as cffi_requests
 from curl_cffi import CurlMime
@@ -20,27 +20,41 @@ logger = logging.getLogger(__name__)
 
 def _normalize_cpa_auth_files_url(api_url: str) -> str:
     """将用户填写的 CPA 地址规范化为 auth-files 接口地址。"""
-    normalized = (api_url or "").strip().rstrip("/")
-    lower_url = normalized.lower()
-
-    if not normalized:
+    raw_url = (api_url or "").strip()
+    if not raw_url:
         return ""
 
-    if lower_url.endswith("/auth-files"):
-        return normalized
+    parsed = urlsplit(raw_url)
+    path = (parsed.path or "").rstrip("/")
+    lower_path = path.lower()
 
-    if lower_url.endswith("/v0/management") or lower_url.endswith("/management"):
-        return f"{normalized}/auth-files"
+    def _build_url(final_path: str) -> str:
+        clean_path = final_path if final_path.startswith("/") else f"/{final_path}"
+        return urlunsplit((parsed.scheme, parsed.netloc, clean_path, "", ""))
 
-    if lower_url.endswith("/v0"):
-        return f"{normalized}/management/auth-files"
+    if lower_path.endswith("/management.html") or lower_path.endswith("/management.htm"):
+        base_path = path.rsplit("/", 1)[0] if "/" in path else ""
+        return _build_url(f"{base_path}/v0/management/auth-files")
 
-    return f"{normalized}/v0/management/auth-files"
+    if lower_path.endswith("/auth-files"):
+        return _build_url(path)
+
+    if lower_path.endswith("/v0/management") or lower_path.endswith("/management"):
+        return _build_url(f"{path}/auth-files")
+
+    if lower_path.endswith("/v0"):
+        return _build_url(f"{path}/management/auth-files")
+
+    if path:
+        return _build_url(f"{path}/v0/management/auth-files")
+
+    return _build_url("/v0/management/auth-files")
 
 
 def _build_cpa_headers(api_token: str, content_type: Optional[str] = None) -> dict:
     headers = {
         "Authorization": f"Bearer {api_token}",
+        "X-Management-Key": api_token,
     }
     if content_type:
         headers["Content-Type"] = content_type

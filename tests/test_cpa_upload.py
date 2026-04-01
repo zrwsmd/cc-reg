@@ -40,6 +40,29 @@ def test_upload_to_cpa_accepts_management_root_url(monkeypatch):
     assert success is True
     assert message == "上传成功"
     assert calls[0]["url"] == "https://cpa.example.com/v0/management/auth-files"
+    assert calls[0]["kwargs"]["headers"]["Authorization"] == "Bearer token-123"
+    assert calls[0]["kwargs"]["headers"]["X-Management-Key"] == "token-123"
+
+
+def test_upload_to_cpa_accepts_management_html_hash_url(monkeypatch):
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, "kwargs": kwargs})
+        return FakeResponse(status_code=201)
+
+    monkeypatch.setattr(cpa_upload, "CurlMime", FakeMime)
+    monkeypatch.setattr(cpa_upload.cffi_requests, "post", fake_post)
+
+    success, message = cpa_upload.upload_to_cpa(
+        {"email": "tester@example.com"},
+        api_url="https://cpa.example.com:8317/management.html#/auth-files",
+        api_token="token-123",
+    )
+
+    assert success is True
+    assert message == "上传成功"
+    assert calls[0]["url"] == "https://cpa.example.com:8317/v0/management/auth-files"
 
 
 def test_upload_to_cpa_does_not_double_append_full_endpoint(monkeypatch):
@@ -108,3 +131,4 @@ def test_test_cpa_connection_uses_get_and_normalized_url(monkeypatch):
     assert message == "CPA 连接测试成功"
     assert calls[0]["url"] == "https://cpa.example.com/v0/management/auth-files"
     assert calls[0]["kwargs"]["headers"]["Authorization"] == "Bearer token-123"
+    assert calls[0]["kwargs"]["headers"]["X-Management-Key"] == "token-123"
