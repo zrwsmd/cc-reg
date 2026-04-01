@@ -385,11 +385,12 @@ class AnyAutoRegistrationEngine:
                     self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
                 tokens = None
                 oauth_client = None
-                for oauth_attempt in range(2):
-                    if oauth_attempt > 0:
-                        self._log(f"同账号 OAuth 重试 {oauth_attempt + 1}/2 ...")
-                        time.sleep(1)
 
+                # 新注册账户是无密码的（邮箱 OTP 注册），直接走 passwordless OTP
+                # 避免密码登录 401 浪费速率配额导致后续 429
+                is_new_registration = not getattr(self, '_is_existing_account', False)
+                if is_new_registration:
+                    self._log("新注册账户（无密码），直接使用 Passwordless OTP 补全 OAuth...")
                     oauth_client = OAuthClient(
                         config=oauth_config,
                         proxy=self.proxy_url,
@@ -398,37 +399,33 @@ class AnyAutoRegistrationEngine:
                     )
                     oauth_client._log = self._log
                     oauth_client.session = chatgpt_client.session
-
-                    tokens = oauth_client.login_and_get_tokens(
+                    tokens = oauth_client.login_passwordless_and_get_tokens(
                         normalized_email,
-                        self.password,
                         chatgpt_client.device_id,
                         chatgpt_client.ua,
                         chatgpt_client.sec_ch_ua,
                         chatgpt_client.impersonate,
                         skymail_adapter,
                     )
-                    if tokens and tokens.get("access_token"):
-                        break
+                else:
+                    # 已有账户：尝试密码登录
+                    for oauth_attempt in range(2):
+                        if oauth_attempt > 0:
+                            self._log(f"同账号 OAuth 重试 {oauth_attempt + 1}/2 ...")
+                            time.sleep(1)
 
-                    if oauth_client.last_error and "add_phone" in oauth_client.last_error:
-                        break
-
-                # 密码登录失败时，尝试 passwordless OTP 登录
-                if not (tokens and tokens.get("access_token")):
-                    pw_err = str(getattr(oauth_client, "last_error", "") or "")
-                    if "add_phone" not in pw_err:
-                        self._log("密码登录失败，尝试 Passwordless OTP 登录...")
-                        oauth_client2 = OAuthClient(
+                        oauth_client = OAuthClient(
                             config=oauth_config,
                             proxy=self.proxy_url,
                             verbose=False,
                             browser_mode=self.browser_mode,
                         )
-                        oauth_client2._log = self._log
-                        oauth_client2.session = chatgpt_client.session
-                        tokens = oauth_client2.login_passwordless_and_get_tokens(
+                        oauth_client._log = self._log
+                        oauth_client.session = chatgpt_client.session
+
+                        tokens = oauth_client.login_and_get_tokens(
                             normalized_email,
+                            self.password,
                             chatgpt_client.device_id,
                             chatgpt_client.ua,
                             chatgpt_client.sec_ch_ua,
@@ -436,7 +433,35 @@ class AnyAutoRegistrationEngine:
                             skymail_adapter,
                         )
                         if tokens and tokens.get("access_token"):
-                            oauth_client = oauth_client2
+                            break
+
+                        if oauth_client.last_error and "add_phone" in oauth_client.last_error:
+                            break
+
+                    # 密码登录失败时，回退到 passwordless OTP
+                    if not (tokens and tokens.get("access_token")):
+                        pw_err = str(getattr(oauth_client, "last_error", "") or "")
+                        if "add_phone" not in pw_err:
+                            self._log("密码登录失败，尝试 Passwordless OTP 登录...")
+                            time.sleep(2)  # 避免 429
+                            oauth_client2 = OAuthClient(
+                                config=oauth_config,
+                                proxy=self.proxy_url,
+                                verbose=False,
+                                browser_mode=self.browser_mode,
+                            )
+                            oauth_client2._log = self._log
+                            oauth_client2.session = chatgpt_client.session
+                            tokens = oauth_client2.login_passwordless_and_get_tokens(
+                                normalized_email,
+                                chatgpt_client.device_id,
+                                chatgpt_client.ua,
+                                chatgpt_client.sec_ch_ua,
+                                chatgpt_client.impersonate,
+                                skymail_adapter,
+                            )
+                            if tokens and tokens.get("access_token"):
+                                oauth_client = oauth_client2
 
                 if tokens and tokens.get("access_token"):
                     self._log("OAuth 回退补全成功！")
