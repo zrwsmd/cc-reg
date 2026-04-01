@@ -51,6 +51,74 @@ def _load_dotenv():
                 os.environ[key] = value
 
 
+def _socket_family_for_host(host: str) -> socket.AddressFamily:
+    """根据监听地址推断 socket family。"""
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
+def _open_probe_socket(host: str, port: int) -> socket.socket:
+    """打开一个临时探测 socket，用于判断端口是否可绑定。"""
+    bind_host = host or "0.0.0.0"
+    sock = socket.socket(_socket_family_for_host(bind_host), socket.SOCK_STREAM)
+
+    if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    elif hasattr(socket, "SO_REUSEADDR"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    if sock.family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+
+    sock.bind((bind_host, port))
+    return sock
+
+
+def _candidate_fallback_ports(preferred_port: int):
+    """优先尝试邻近端口，再退回系统分配。"""
+    upper_bound = min(preferred_port + 20, 65535)
+    for candidate in range(preferred_port + 1, upper_bound + 1):
+        yield candidate
+    yield 0
+
+
+def _select_webui_port(host: str, preferred_port: int) -> tuple[int, bool]:
+    """优先使用配置端口；若被占用则自动切换到同 host 下的空闲端口。"""
+    probe = None
+    bind_host = host or "0.0.0.0"
+
+    try:
+        probe = _open_probe_socket(bind_host, preferred_port)
+        return preferred_port, False
+    except OSError:
+        if probe is not None:
+            probe.close()
+
+        for fallback_port in _candidate_fallback_ports(preferred_port):
+            fallback_probe = None
+            try:
+                fallback_probe = _open_probe_socket(bind_host, fallback_port)
+                return fallback_probe.getsockname()[1], True
+            except OSError:
+                continue
+            finally:
+                if fallback_probe is not None:
+                    fallback_probe.close()
+
+        raise
+    finally:
+        if probe is not None:
+            probe.close()
+
+
+def _format_access_host(host: str) -> str:
+    """将通配监听地址转换为更适合展示的访问地址。"""
+    if host in ("0.0.0.0", "", None):
+        return "127.0.0.1"
+    if host == "::":
+        return "[::1]"
+    return host
+
+
 def setup_application():
     """设置应用程序"""
     # 统一进程时区为北京时间，避免容器默认 UTC 导致时间错位
@@ -117,7 +185,16 @@ def start_webui():
     }
 
     logger = logging.getLogger(__name__)
-    logger.info(f"Web UI 已就位，请走这边: http://{settings.webui_host}:{settings.webui_port}")
+    selected_port, port_switched = _select_webui_port(settings.webui_host, settings.webui_port)
+    if port_switched:
+        logger.warning(
+            f"Web UI 端口 {settings.webui_port} 已被占用，已自动切换到可用端口 {selected_port}"
+        )
+        settings.webui_port = selected_port
+        uvicorn_config["port"] = selected_port
+
+    access_host = _format_access_host(settings.webui_host)
+    logger.info(f"Web UI 已就位，请走这边: http://{access_host}:{uvicorn_config['port']}")
     logger.info(f"调试模式: {settings.debug}")
 
     # 启动服务器
