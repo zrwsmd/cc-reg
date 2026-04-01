@@ -122,6 +122,76 @@ class AnyAutoRegistrationEngine:
         return ""
 
     @staticmethod
+    def _extract_client_id_from_token(token: str) -> str:
+        payload = decode_jwt_payload(token)
+        if not isinstance(payload, dict):
+            return ""
+        auth_claims = payload.get("https://api.openai.com/auth") or {}
+        for key in ("client_id", "clientId", "azp"):
+            value = str(payload.get(key) or auth_claims.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _evaluate_session_token_bundle(self, session_result: Dict[str, Any], oauth_client_id: str) -> Dict[str, Any]:
+        access_token = str(session_result.get("access_token", "") or "").strip()
+        refresh_token = str(session_result.get("refresh_token", "") or "").strip()
+        id_token = str(session_result.get("id_token", "") or "").strip()
+        actual_client_id = self._extract_client_id_from_token(access_token) or self._extract_client_id_from_token(id_token)
+
+        reasons = []
+        if not refresh_token:
+            reasons.append("missing_refresh_token")
+        if not id_token:
+            reasons.append("missing_id_token")
+        if oauth_client_id and actual_client_id and actual_client_id != oauth_client_id:
+            reasons.append("client_id_mismatch")
+
+        return {
+            "requires_oauth_fallback": bool(reasons),
+            "actual_client_id": actual_client_id,
+            "reasons": reasons,
+        }
+
+    def _build_session_success_payload(
+        self,
+        session_result: Dict[str, Any],
+        oauth_client_id: str,
+        *,
+        oauth_eval: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        account_id = str(session_result.get("account_id", "") or "").strip()
+        if not account_id:
+            account_id = str(session_result.get("workspace_id", "") or "").strip()
+        if not account_id:
+            account_id = self._extract_account_id_from_token(session_result.get("access_token", ""))
+        workspace_id = str(session_result.get("workspace_id", "") or "").strip() or account_id
+
+        evaluation = oauth_eval or self._evaluate_session_token_bundle(session_result, oauth_client_id)
+        reasons = list(evaluation.get("reasons") or [])
+
+        return {
+            "success": True,
+            "access_token": session_result.get("access_token", ""),
+            "session_token": session_result.get("session_token", ""),
+            "account_id": account_id,
+            "workspace_id": workspace_id,
+            "metadata": {
+                "auth_provider": session_result.get("auth_provider", ""),
+                "expires": session_result.get("expires", ""),
+                "user_id": session_result.get("user_id", ""),
+                "user": session_result.get("user") or {},
+                "account": session_result.get("account") or {},
+                "access_token_client_id": evaluation.get("actual_client_id", ""),
+                "expected_oauth_client_id": oauth_client_id,
+                "requires_oauth_bundle": bool(evaluation.get("requires_oauth_fallback")),
+                "oauth_bundle_complete": not reasons,
+                "oauth_fallback_reasons": reasons,
+                "cpa_upload_compatible": not reasons,
+            },
+        }
+
+    @staticmethod
     def _is_phone_required_error(message: str) -> bool:
         text = str(message or "").lower()
         return any(
@@ -281,31 +351,30 @@ class AnyAutoRegistrationEngine:
                 # 5. 复用 session 取 token
                 self._log("步骤 2/2: 优先复用注册会话提取 ChatGPT Session / AccessToken...")
                 session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
+                session_success_payload = None
                 if session_ok:
                     self._log("Token 提取完成！")
-                    account_id = str(session_result.get("account_id", "") or "").strip()
-                    if not account_id:
-                        account_id = str(session_result.get("workspace_id", "") or "").strip()
-                    if not account_id:
-                        account_id = self._extract_account_id_from_token(session_result.get("access_token", ""))
-                    workspace_id = str(session_result.get("workspace_id", "") or "").strip() or account_id
-                    return {
-                        "success": True,
-                        "access_token": session_result.get("access_token", ""),
-                        "session_token": session_result.get("session_token", ""),
-                        "account_id": account_id,
-                        "workspace_id": workspace_id,
-                        "metadata": {
-                            "auth_provider": session_result.get("auth_provider", ""),
-                            "expires": session_result.get("expires", ""),
-                            "user_id": session_result.get("user_id", ""),
-                            "user": session_result.get("user") or {},
-                            "account": session_result.get("account") or {},
-                        },
-                    }
+                    oauth_client_id = str(oauth_config.get("oauth_client_id", "") or "").strip()
+                    session_eval = self._evaluate_session_token_bundle(session_result, oauth_client_id)
+                    session_success_payload = self._build_session_success_payload(
+                        session_result,
+                        oauth_client_id,
+                        oauth_eval=session_eval,
+                    )
+
+                    if not session_eval.get("requires_oauth_fallback"):
+                        return session_success_payload
+
+                    reason_text = ", ".join(session_eval.get("reasons") or []) or "incomplete_oauth_bundle"
+                    actual_client_id = str(session_eval.get("actual_client_id", "") or "").strip() or "-"
+                    self._log(
+                        f"当前复用会话只拿到网页会话 token，client_id={actual_client_id}，"
+                        f"原因={reason_text}，继续补全 OAuth Tokens..."
+                    )
 
                 # 6. OAuth 回退
-                self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
+                if not session_ok:
+                    self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
                 tokens = None
                 oauth_client = None
                 for oauth_attempt in range(2):
@@ -382,6 +451,17 @@ class AnyAutoRegistrationEngine:
                             "oauth_error": oauth_client.last_error,
                         },
                     }
+
+                if session_success_payload:
+                    self._log("OAuth 补全失败，暂时保留 session-only 结果，但远程 CPA/Codex 调用可能失败")
+                    session_metadata = session_success_payload.setdefault("metadata", {})
+                    session_metadata.update({
+                        "oauth_bundle_complete": False,
+                        "oauth_fallback_failed": True,
+                        "oauth_error": str(getattr(oauth_client, "last_error", "") or "").strip(),
+                        "cpa_upload_compatible": False,
+                    })
+                    return session_success_payload
 
                 last_error = str(getattr(oauth_client, "last_error", "") or "").strip() or "获取最终 OAuth Tokens 失败"
                 return {"success": False, "error_message": f"账号已创建成功，但 {last_error}"}

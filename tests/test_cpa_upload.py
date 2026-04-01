@@ -24,6 +24,16 @@ class FakeMime:
         self.parts.append(kwargs)
 
 
+def make_jwt(payload):
+    return ".".join(
+        [
+            cpa_upload._base64url_encode_json({"alg": "none", "typ": "JWT"}),
+            cpa_upload._base64url_encode_json(payload),
+            "signature",
+        ]
+    )
+
+
 def make_account(**overrides):
     data = {
         "email": "tester@example.com",
@@ -31,10 +41,20 @@ def make_account(**overrides):
         "id_token": "",
         "account_id": "acct-123",
         "workspace_id": "ws-456",
-        "access_token": "access-token",
+        "access_token": make_jwt(
+            {
+                "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-123",
+                    "workspace_id": "ws-456",
+                },
+            }
+        ),
         "last_refresh": datetime(2026, 4, 1, 8, 0, 0),
         "refresh_token": "refresh-token",
         "subscription_type": "plus",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "session_token": "session-token",
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -47,6 +67,8 @@ def test_generate_token_json_backfills_codex_id_token_when_missing():
     assert token_data["chatgpt_account_id"] == "acct-123"
     assert token_data["workspace_id"] == "ws-456"
     assert token_data["plan_type"] == "plus"
+    assert token_data["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann"
+    assert token_data["session_token"] == "session-token"
 
     assert token_data["id_token"].count(".") == 2
     id_token_payload = cpa_upload._decode_jwt_payload(token_data["id_token"])
@@ -167,8 +189,10 @@ def test_upload_to_cpa_falls_back_to_raw_json_when_multipart_returns_404(monkeyp
     monkeypatch.setattr(cpa_upload, "CurlMime", FakeMime)
     monkeypatch.setattr(cpa_upload.cffi_requests, "post", fake_post)
 
+    token_data = cpa_upload.generate_token_json(make_account(email="tester@example.com"))
+
     success, message = cpa_upload.upload_to_cpa(
-        {"email": "tester@example.com", "type": "codex"},
+        token_data,
         api_url="https://cpa.example.com",
         api_token="token-123",
     )
@@ -179,6 +203,29 @@ def test_upload_to_cpa_falls_back_to_raw_json_when_multipart_returns_404(monkeyp
     assert calls[1]["url"] == "https://cpa.example.com/v0/management/auth-files?name=tester%40example.com.json"
     assert calls[1]["kwargs"]["headers"]["Content-Type"] == "application/json"
     assert calls[1]["kwargs"]["data"].startswith(b"{")
+
+
+def test_upload_to_cpa_rejects_incomplete_codex_bundle_before_network_call(monkeypatch):
+    called = {"post": False}
+
+    def fake_post(url, **kwargs):
+        called["post"] = True
+        return FakeResponse(status_code=201)
+
+    monkeypatch.setattr(cpa_upload, "CurlMime", FakeMime)
+    monkeypatch.setattr(cpa_upload.cffi_requests, "post", fake_post)
+
+    token_data = cpa_upload.generate_token_json(make_account(refresh_token=""))
+
+    success, message = cpa_upload.upload_to_cpa(
+        token_data,
+        api_url="https://cpa.example.com",
+        api_token="token-123",
+    )
+
+    assert success is False
+    assert "refresh_token" in message
+    assert called["post"] is False
 
 
 def test_test_cpa_connection_uses_get_and_normalized_url(monkeypatch):

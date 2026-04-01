@@ -103,6 +103,20 @@ def _extract_plan_type_from_token(token: Optional[str]) -> str:
     return ""
 
 
+def _extract_client_id_from_token(token: Optional[str]) -> str:
+    payload = _parse_json_object(token) or _decode_jwt_payload(token)
+    if not payload:
+        return ""
+
+    auth = _extract_auth_claim(payload)
+    for key in ("client_id", "clientId", "azp"):
+        value = str(payload.get(key) or auth.get(key) or "").strip()
+        if value:
+            return value
+
+    return ""
+
+
 def _is_jwt_token(token: Optional[str]) -> bool:
     token_text = str(token or "").strip()
     return token_text.count(".") == 2 and bool(_decode_jwt_payload(token_text))
@@ -133,6 +147,23 @@ def _resolve_plan_type(account: Account) -> str:
             return value
 
     return ""
+
+
+def _resolve_client_id(account: Account) -> str:
+    for candidate in (
+        getattr(account, "client_id", None),
+        _extract_client_id_from_token(getattr(account, "access_token", None)),
+        _extract_client_id_from_token(getattr(account, "id_token", None)),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+
+    return ""
+
+
+def _resolve_session_token(account: Account) -> str:
+    return str(getattr(account, "session_token", "") or "").strip()
 
 
 def _build_export_id_token(account: Account, chatgpt_account_id: str, workspace_id: str, plan_type: str) -> str:
@@ -267,6 +298,28 @@ def _post_cpa_auth_file_raw_json(upload_url: str, filename: str, file_content: b
     )
 
 
+def _get_codex_upload_blocker(token_data: Dict[str, Any]) -> str:
+    if str(token_data.get("type", "") or "").strip().lower() != "codex":
+        return ""
+
+    refresh_token = str(token_data.get("refresh_token", "") or "").strip()
+    expected_client_id = str(token_data.get("client_id", "") or "").strip()
+    actual_client_id = _extract_client_id_from_token(token_data.get("access_token")) or _extract_client_id_from_token(
+        token_data.get("id_token")
+    )
+
+    issues = []
+    if not refresh_token:
+        issues.append("缺少 refresh_token")
+    if expected_client_id and actual_client_id and expected_client_id != actual_client_id:
+        issues.append("access_token 的 client_id 与配置的 Codex OAuth client_id 不匹配")
+
+    if not issues:
+        return ""
+
+    return "当前账号不是完整的 Codex OAuth 凭证，上传到远程 CLIProxyAPI 后会出现 no auth available：" + "；".join(issues)
+
+
 def generate_token_json(account: Account) -> dict:
     """
     生成 CPA 格式的 Token JSON
@@ -280,9 +333,11 @@ def generate_token_json(account: Account) -> dict:
     chatgpt_account_id = _resolve_chatgpt_account_id(account)
     workspace_id = str(getattr(account, "workspace_id", "") or chatgpt_account_id or "").strip()
     plan_type = _resolve_plan_type(account)
+    client_id = _resolve_client_id(account)
+    session_token = _resolve_session_token(account)
     export_id_token = _build_export_id_token(account, chatgpt_account_id, workspace_id, plan_type)
 
-    return {
+    token_data = {
         "type": "codex",
         "email": account.email,
         "expired": account.expires_at.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.expires_at else "",
@@ -295,6 +350,13 @@ def generate_token_json(account: Account) -> dict:
         "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.last_refresh else "",
         "refresh_token": account.refresh_token or "",
     }
+
+    if client_id:
+        token_data["client_id"] = client_id
+    if session_token:
+        token_data["session_token"] = session_token
+
+    return token_data
 
 
 def upload_to_cpa(
@@ -332,6 +394,9 @@ def upload_to_cpa(
         return False, "CPA API Token 未配置"
 
     upload_url = _normalize_cpa_auth_files_url(effective_url)
+    blocker = _get_codex_upload_blocker(token_data)
+    if blocker:
+        return False, blocker
 
     filename = f"{token_data['email']}.json"
     file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
