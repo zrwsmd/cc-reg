@@ -335,6 +335,55 @@ def test_verify_email_otp_retries_same_code_after_network_timeout():
     assert validated_codes == ["112233", "112233"]
 
 
+def test_validate_verification_code_reports_probe_reason_after_timeout():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    timeout_error = Exception(
+        "Failed to perform, curl: (28) Operation timed out after 60006 milliseconds with 0 bytes received."
+    )
+    probe_response = DummyResponse(status_code=200, payload={})
+    probe_response.url = "https://auth.openai.com/email-verification"
+
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], lambda _session: (_ for _ in ()).throw(timeout_error)),
+        ("GET", "https://auth.openai.com/email-verification", probe_response),
+    ])
+    engine.session = session
+
+    result = engine._validate_verification_code("123456")
+
+    assert result is False
+    assert engine._last_otp_validation_outcome == "network_timeout"
+    assert "email-verification" in engine._last_otp_validation_reason
+    assert any("验证码校验未推进" in log for log in engine.logs)
+    assert all("curl: (28)" not in log for log in engine.logs)
+
+
+def test_validate_verification_code_treats_timeout_as_success_when_probe_progressed():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    timeout_error = Exception(
+        "Failed to perform, curl: (28) Operation timed out after 60006 milliseconds with 0 bytes received."
+    )
+    probe_response = DummyResponse(status_code=200, payload={})
+    probe_response.url = "https://auth.openai.com/about-you"
+
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], lambda _session: (_ for _ in ()).throw(timeout_error)),
+        ("GET", "https://auth.openai.com/email-verification", probe_response),
+    ])
+    engine.session = session
+
+    result = engine._validate_verification_code("654321")
+
+    assert result is True
+    assert engine._last_otp_validation_outcome == "success"
+    assert engine._last_validate_otp_continue_url == "https://auth.openai.com/about-you"
+    assert "about-you" in engine._last_otp_validation_reason
+
+
 def test_create_user_account_treats_timeout_as_success_when_probe_has_progress():
     email_service = FakeEmailService([])
     engine = RegistrationEngine(email_service)

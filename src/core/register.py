@@ -162,6 +162,7 @@ class RegistrationEngine:
         self._last_otp_validation_code: Optional[str] = None
         self._last_otp_validation_status_code: Optional[int] = None
         self._last_otp_validation_outcome: str = ""  # success/http_non_200/network_timeout/network_error
+        self._last_otp_validation_reason: str = ""
         self._oai_session_id: str = str(uuid.uuid4())
         self._oai_client_version: str = _DEFAULT_OAI_CLIENT_VERSION
         self._oai_client_build: str = _DEFAULT_OAI_CLIENT_BUILD
@@ -2655,6 +2656,263 @@ class RegistrationEngine:
                 if self._last_otp_validation_outcome in {"network_timeout", "network_error"}:
                     self._log(
                         f"{stage_label}第 {attempt}/{max_attempts} 次同一码重试后仍然网络异常，继续等待后续验证码...",
+                        "warning",
+                    )
+                else:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次校验未通过，疑似旧验证码，自动重试下一封...",
+                        "warning",
+                    )
+                time.sleep(2)
+
+        return False
+
+    def _probe_otp_validation_progress(self) -> Tuple[bool, str]:
+        probe_url = "https://auth.openai.com/email-verification"
+        try:
+            probe_response = self.session.get(
+                probe_url,
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+                allow_redirects=True,
+                timeout=15,
+            )
+            final_url = str(getattr(probe_response, "url", "") or probe_url).strip()
+            final_url_lower = final_url.lower()
+            self._log(f"OTP 校验状态探测: {probe_response.status_code} {final_url[:120]}...")
+
+            if "email-verification" in final_url_lower or "email-otp" in final_url_lower:
+                return False, "状态仍停留在 email-verification，服务端没有推进验证码校验"
+
+            if "about-you" in final_url_lower:
+                self._last_validate_otp_continue_url = final_url
+                return True, "状态已推进到 about-you"
+
+            if "add-phone" in final_url_lower:
+                self._last_validate_otp_continue_url = final_url
+                self._create_account_page_type = "add_phone"
+                return True, "状态已推进到 add-phone"
+
+            if "/api/auth/callback/openai" in final_url_lower and "code=" in final_url_lower:
+                self._last_validate_otp_continue_url = final_url
+                return True, "状态已推进到 OAuth callback"
+
+            if "chatgpt.com" in final_url_lower and "auth.openai.com" not in final_url_lower:
+                self._last_validate_otp_continue_url = final_url
+                return True, "状态已推进到 ChatGPT"
+
+            return False, f"状态停留在未知页面: {final_url[:120]}..."
+
+        except Exception as probe_error:
+            probe_text = str(probe_error or "").lower()
+            if (
+                "timed out" in probe_text
+                or "timeout" in probe_text
+                or "curl: (28)" in probe_text
+                or "operation timed out" in probe_text
+            ):
+                return False, "状态探测也超时，暂时无法判断服务端是否已处理验证码"
+            return False, "状态探测失败，暂时无法判断服务端是否已处理验证码"
+
+    def _validate_verification_code(self, code: str) -> bool:
+        """校验邮箱验证码，并在异常时输出更具体的状态诊断。"""
+        try:
+            self._last_otp_validation_code = str(code or "").strip()
+            self._last_otp_validation_status_code = None
+            self._last_otp_validation_outcome = ""
+            self._last_otp_validation_reason = ""
+            code_body = f'{{"code":"{code}"}}'
+
+            response = self.session.post(
+                OPENAI_API_ENDPOINTS["validate_otp"],
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                data=code_body,
+                timeout=60,
+            )
+
+            self._log(f"验证码校验状态: {response.status_code}")
+            self._last_otp_validation_status_code = int(response.status_code)
+            self._last_otp_validation_outcome = "success" if response.status_code == 200 else "http_non_200"
+
+            if response.status_code == 200:
+                self._last_otp_validation_reason = "服务端已接受验证码"
+                try:
+                    import urllib.parse as urlparse
+
+                    payload = response.json() or {}
+                    candidates: List[Dict[str, Any]] = []
+                    if isinstance(payload, dict):
+                        candidates.append(payload)
+                        for key in ("data", "result", "next", "payload"):
+                            value = payload.get(key)
+                            if isinstance(value, dict):
+                                candidates.append(value)
+
+                    found_continue = ""
+                    found_workspace = ""
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        if not found_workspace:
+                            found_workspace = str(
+                                item.get("workspace_id")
+                                or item.get("workspaceId")
+                                or item.get("default_workspace_id")
+                                or ((item.get("workspace") or {}).get("id") if isinstance(item.get("workspace"), dict) else "")
+                                or ""
+                            ).strip()
+                        if not found_continue:
+                            for key in ("continue_url", "continueUrl", "next_url", "nextUrl", "redirect_url", "redirectUrl", "url"):
+                                candidate = str(item.get(key) or "").strip()
+                                if not candidate:
+                                    continue
+                                if candidate.startswith("/"):
+                                    candidate = urlparse.urljoin(OPENAI_API_ENDPOINTS["validate_otp"], candidate)
+                                found_continue = candidate
+                                break
+                        if found_workspace and found_continue:
+                            break
+
+                    if found_workspace:
+                        self._last_validate_otp_workspace_id = found_workspace
+                        self._log(f"OTP 校验返回 Workspace ID: {found_workspace}")
+                    if found_continue:
+                        self._last_validate_otp_continue_url = found_continue
+                        self._log(f"OTP 校验返回 continue_url: {found_continue[:100]}...")
+                except Exception as parse_err:
+                    self._log(f"解析 OTP 校验返回信息失败: {parse_err}", "warning")
+
+                return True
+
+            progressed, reason = self._probe_otp_validation_progress()
+            self._last_otp_validation_reason = reason
+            if progressed:
+                self._last_otp_validation_outcome = "success"
+                self._log(f"验证码接口虽然返回 HTTP {response.status_code}，但{reason}，按验证成功继续", "warning")
+                return True
+
+            self._log(f"验证码校验未通过：HTTP {response.status_code}，{reason}", "warning")
+            return False
+
+        except Exception as e:
+            err_text = str(e or "").lower()
+            if (
+                "timed out" in err_text
+                or "timeout" in err_text
+                or "curl: (28)" in err_text
+                or "operation timed out" in err_text
+            ):
+                self._last_otp_validation_outcome = "network_timeout"
+            else:
+                self._last_otp_validation_outcome = "network_error"
+
+            progressed, reason = self._probe_otp_validation_progress()
+            self._last_otp_validation_reason = reason
+            if progressed:
+                self._last_otp_validation_outcome = "success"
+                self._log(f"验证码校验请求异常，但{reason}，按验证成功继续", "warning")
+                return True
+
+            self._log(f"验证码校验未推进：{reason}", "warning")
+            return False
+
+    def _verify_email_otp_with_retry(
+        self,
+        stage_label: str = "验证码",
+        max_attempts: int = 3,
+        fetch_timeout: Optional[int] = None,
+        attempted_codes: Optional[set[str]] = None,
+    ) -> bool:
+        """获取并校验邮箱验证码，网络异常时优先输出状态诊断。"""
+        self._last_validate_otp_continue_url = None
+        self._last_validate_otp_workspace_id = None
+        if attempted_codes is None:
+            attempted_codes = set()
+
+        def _is_login_stage() -> bool:
+            if not stage_label:
+                return False
+            stage_label_lower = stage_label.lower()
+            return (
+                "登录验证码" in stage_label
+                or "login" in stage_label_lower
+                or "会话桥接" in stage_label
+            )
+
+        def _current_reason() -> str:
+            return str(self._last_otp_validation_reason or self._last_otp_validation_outcome or "未知原因").strip()
+
+        def _validate_same_code_with_network_retry(code: str, attempt: int) -> bool:
+            same_code_attempt = 0
+            max_same_code_attempts = 2
+
+            while same_code_attempt < max_same_code_attempts:
+                same_code_attempt += 1
+                if self._validate_verification_code(code):
+                    if _is_login_stage():
+                        self._touch_otp_continue_url(stage_label)
+                    return True
+
+                if self._last_otp_validation_outcome not in {"network_timeout", "network_error"}:
+                    return False
+
+                if same_code_attempt >= max_same_code_attempts:
+                    return False
+
+                self._log(
+                    f"{stage_label}第 {attempt}/{max_attempts} 次校验遇到网络异常，{_current_reason()}，直接重试同一码 {code}...",
+                    "warning",
+                )
+                time.sleep(2)
+
+            return False
+
+        for attempt in range(1, max_attempts + 1):
+            code = (
+                self._get_verification_code(timeout=fetch_timeout)
+                if fetch_timeout
+                else self._get_verification_code()
+            )
+            if not code:
+                if attempt < max_attempts:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次未取到验证码，稍后重试...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+            allow_duplicate_retry = (
+                code in attempted_codes
+                and self._last_otp_validation_code == code
+                and self._last_otp_validation_outcome in {"network_timeout", "network_error"}
+            )
+            if code in attempted_codes and not allow_duplicate_retry:
+                if attempt < max_attempts:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次命中重复验证码 {code}，等待新邮件...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+            attempted_codes.add(code)
+
+            if _validate_same_code_with_network_retry(code, attempt):
+                return True
+
+            if attempt < max_attempts:
+                if self._last_otp_validation_outcome in {"network_timeout", "network_error"}:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次同一码重试后仍未推进，原因：{_current_reason()}，继续等待后续验证码...",
                         "warning",
                     )
                 else:
