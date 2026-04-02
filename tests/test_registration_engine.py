@@ -1,6 +1,7 @@
 import base64
 import json
 
+import src.core.register as register_module
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
@@ -294,3 +295,230 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_verify_email_otp_retries_same_code_after_network_timeout():
+    email_service = FakeEmailService(["112233"])
+    engine = RegistrationEngine(email_service)
+
+    fetched_codes = []
+    validated_codes = []
+
+    def fake_get_verification_code(timeout=None):
+        fetched_codes.append(timeout)
+        if len(fetched_codes) > 1:
+            raise AssertionError("should retry the same OTP before fetching a new email")
+        return "112233"
+
+    def fake_validate_verification_code(code):
+        validated_codes.append(code)
+        engine._last_otp_validation_code = code
+        engine._last_otp_validation_status_code = None
+        if len(validated_codes) == 1:
+            engine._last_otp_validation_outcome = "network_timeout"
+            return False
+        engine._last_otp_validation_outcome = "success"
+        return True
+
+    original_sleep = register_module.time.sleep
+    engine._get_verification_code = fake_get_verification_code
+    engine._validate_verification_code = fake_validate_verification_code
+    register_module.time.sleep = lambda _seconds: None
+
+    try:
+        result = engine._verify_email_otp_with_retry(stage_label="注册验证码", max_attempts=3)
+    finally:
+        register_module.time.sleep = original_sleep
+
+    assert result is True
+    assert fetched_codes == [None]
+    assert validated_codes == ["112233", "112233"]
+
+
+def test_create_user_account_treats_timeout_as_success_when_probe_has_progress():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    timeout_error = Exception(
+        "Failed to perform, curl: (28) Operation timed out after 30001 milliseconds with 0 bytes received."
+    )
+    probe_response = DummyResponse(status_code=200, payload={})
+    probe_response.url = "https://auth.openai.com/add-phone"
+
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["create_account"], lambda _session: (_ for _ in ()).throw(timeout_error)),
+        ("GET", "https://auth.openai.com/about-you", probe_response),
+    ])
+
+    original_generate_user_info = register_module.generate_random_user_info
+    original_build_sentinel_token = register_module.build_sentinel_token
+    original_generate_datadog_trace = register_module.generate_datadog_trace
+    engine.session = session
+    register_module.generate_random_user_info = lambda: {
+        "name": "Alice Example",
+        "birthdate": "1994-06-15",
+    }
+    register_module.build_sentinel_token = lambda *args, **kwargs: "sentinel-token"
+    register_module.generate_datadog_trace = lambda: {"traceparent": "trace-1"}
+
+    try:
+        result = engine._create_user_account()
+    finally:
+        register_module.generate_random_user_info = original_generate_user_info
+        register_module.build_sentinel_token = original_build_sentinel_token
+        register_module.generate_datadog_trace = original_generate_datadog_trace
+
+    assert result is True
+    assert engine._create_account_page_type == "add_phone"
+    assert len([call for call in session.calls if call["method"] == "POST"]) == 1
+    headers = session.calls[0]["kwargs"]["headers"]
+    assert headers["oai-device-id"] == engine.device_id
+    assert headers["openai-sentinel-token"] == "sentinel-token"
+    assert headers["traceparent"] == "trace-1"
+
+
+def test_create_user_account_retries_same_payload_after_timeout_without_progress():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    timeout_error = Exception(
+        "Failed to perform, curl: (28) Operation timed out after 30001 milliseconds with 0 bytes received."
+    )
+    probe_response = DummyResponse(status_code=200, payload={})
+    probe_response.url = "https://auth.openai.com/about-you"
+
+    create_response = DummyResponse(
+        status_code=200,
+        payload={
+            "continue_url": "https://auth.openai.com/add-phone",
+            "page": {"type": "add_phone"},
+        },
+    )
+    create_response.url = "https://auth.openai.com/add-phone"
+
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["create_account"], lambda _session: (_ for _ in ()).throw(timeout_error)),
+        ("GET", "https://auth.openai.com/about-you", probe_response),
+        ("POST", OPENAI_API_ENDPOINTS["create_account"], create_response),
+    ])
+
+    original_generate_user_info = register_module.generate_random_user_info
+    original_build_sentinel_token = register_module.build_sentinel_token
+    original_generate_datadog_trace = register_module.generate_datadog_trace
+    original_sleep = register_module.time.sleep
+    engine.session = session
+    register_module.generate_random_user_info = lambda: {
+        "name": "Bob Example",
+        "birthdate": "1996-12-03",
+    }
+    register_module.build_sentinel_token = lambda *args, **kwargs: "sentinel-token"
+    register_module.generate_datadog_trace = lambda: {"traceparent": "trace-2"}
+    register_module.time.sleep = lambda _seconds: None
+
+    try:
+        result = engine._create_user_account()
+    finally:
+        register_module.generate_random_user_info = original_generate_user_info
+        register_module.build_sentinel_token = original_build_sentinel_token
+        register_module.generate_datadog_trace = original_generate_datadog_trace
+        register_module.time.sleep = original_sleep
+
+    assert result is True
+    post_calls = [call for call in session.calls if call["method"] == "POST"]
+    assert len(post_calls) == 2
+    assert post_calls[0]["kwargs"]["json"] == post_calls[1]["kwargs"]["json"]
+    assert post_calls[0]["kwargs"]["headers"]["openai-sentinel-token"] == "sentinel-token"
+    assert engine._create_account_page_type == "add_phone"
+
+
+def test_complete_token_exchange_native_backup_stops_on_add_phone_gate():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    result = register_module.RegistrationResult(success=False, logs=engine.logs)
+
+    engine.password = "secret-1"
+    engine.device_id = "device-1"
+    engine._verify_email_otp_with_retry = lambda *args, **kwargs: True
+    engine._get_workspace_id = lambda: ""
+    engine._last_validate_otp_continue_url = "https://auth.openai.com/add-phone"
+    engine._create_account_page_type = "add_phone"
+    engine._follow_redirects = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not follow redirects"))
+
+    complete_ok = engine._complete_token_exchange_native_backup(result)
+
+    assert complete_ok is False
+    assert "add-phone" in result.error_message
+    assert result.password == "secret-1"
+    assert result.device_id == "device-1"
+
+
+def test_register_password_treats_timeout_as_success_when_probe_has_progress():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+
+    timeout_error = Exception(
+        "Failed to perform, curl: (28) Operation timed out after 30001 milliseconds with 0 bytes received."
+    )
+    probe_response = DummyResponse(status_code=200, payload={})
+    probe_response.url = "https://auth.openai.com/email-verification"
+
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["register"], lambda _session: (_ for _ in ()).throw(timeout_error)),
+        ("GET", "https://auth.openai.com/email-verification", probe_response),
+    ])
+
+    original_generate_datadog_trace = register_module.generate_datadog_trace
+    original_sleep = register_module.time.sleep
+    engine.session = session
+    register_module.generate_datadog_trace = lambda: {"traceparent": "trace-register-1"}
+    register_module.time.sleep = lambda _seconds: None
+
+    try:
+        success, password = engine._register_password()
+    finally:
+        register_module.generate_datadog_trace = original_generate_datadog_trace
+        register_module.time.sleep = original_sleep
+
+    assert success is True
+    assert password == engine.password
+    post_headers = session.calls[0]["kwargs"]["headers"]
+    assert post_headers["traceparent"] == "trace-register-1"
+    assert session.calls[0]["kwargs"]["json"]["username"] == "tester@example.com"
+
+
+def test_register_password_retries_same_payload_after_timeout_without_progress():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+
+    timeout_error = Exception(
+        "Failed to perform, curl: (28) Operation timed out after 30001 milliseconds with 0 bytes received."
+    )
+    probe_response = DummyResponse(status_code=200, payload={})
+    probe_response.url = "https://auth.openai.com/create-account/password"
+    success_response = DummyResponse(status_code=200, payload={})
+
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["register"], lambda _session: (_ for _ in ()).throw(timeout_error)),
+        ("GET", "https://auth.openai.com/email-verification", probe_response),
+        ("POST", OPENAI_API_ENDPOINTS["register"], success_response),
+    ])
+
+    original_generate_datadog_trace = register_module.generate_datadog_trace
+    original_sleep = register_module.time.sleep
+    engine.session = session
+    register_module.generate_datadog_trace = lambda: {"traceparent": "trace-register-2"}
+    register_module.time.sleep = lambda _seconds: None
+
+    try:
+        success, password = engine._register_password()
+    finally:
+        register_module.generate_datadog_trace = original_generate_datadog_trace
+        register_module.time.sleep = original_sleep
+
+    assert success is True
+    assert password == engine.password
+    post_calls = [call for call in session.calls if call["method"] == "POST"]
+    assert len(post_calls) == 2
+    assert post_calls[0]["kwargs"]["json"] == post_calls[1]["kwargs"]["json"]

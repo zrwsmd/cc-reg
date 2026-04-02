@@ -111,6 +111,10 @@ class ChatGPTClient:
         # 设置 oai-did cookie
         seed_oai_device_cookie(self.session, self.device_id)
         self.last_registration_state = FlowState()
+        self._last_register_status_code = None
+        self._last_register_outcome = ""
+        self._last_otp_validation_status_code = None
+        self._last_otp_validation_outcome = ""
     
     def _log(self, msg):
         """输出日志"""
@@ -277,6 +281,71 @@ class ChatGPTClient:
         except Exception as e:
             self._log(f"跟随 continue_url 失败: {e}")
             return False, str(e)
+
+    @staticmethod
+    def _is_timeout_error(exc) -> bool:
+        text = str(exc or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "timed out",
+                "timeout",
+                "curl: (28)",
+                "operation timed out",
+            )
+        )
+
+    @classmethod
+    def _is_transient_network_error(cls, exc) -> bool:
+        text = str(exc or "").lower()
+        if cls._is_timeout_error(exc):
+            return True
+        return any(
+            marker in text
+            for marker in (
+                "failed to perform",
+                "connection reset",
+                "connection aborted",
+                "connection refused",
+                "network is unreachable",
+                "recv failure",
+                "send failure",
+                "ssl",
+                "tls",
+                "proxy connect aborted",
+            )
+        )
+
+    def _probe_auth_state(self, probe_url, referer=None):
+        """关键请求异常后主动探测当前 auth 状态是否已经推进。"""
+        try:
+            self._browser_pause()
+            r = self.session.get(
+                probe_url,
+                headers=self._headers(
+                    probe_url,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer=referer,
+                    navigation=True,
+                ),
+                allow_redirects=True,
+                timeout=15,
+            )
+            final_url = str(r.url or probe_url)
+            content_type = (r.headers.get("content-type", "") or "").lower()
+            if "application/json" in content_type:
+                try:
+                    state = self._state_from_payload(r.json(), current_url=final_url)
+                except Exception:
+                    state = self._state_from_url(final_url)
+            else:
+                state = self._state_from_url(final_url)
+
+            self._log(f"状态探测 -> {describe_flow_state(state)}")
+            return state
+        except Exception as e:
+            self._log(f"状态探测失败: {e}")
+            return None
 
     def _get_cookie_value(self, name, domain_hint=None):
         """读取当前会话中的 Cookie。"""
@@ -569,8 +638,12 @@ class ChatGPTClient:
         }
         
         try:
+            self._last_register_status_code = None
+            self._last_register_outcome = ""
             self._browser_pause()
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            self._last_register_status_code = int(r.status_code)
+            self._last_register_outcome = "success" if r.status_code == 200 else "http_non_200"
             
             if r.status_code == 200:
                 data = r.json()
@@ -586,7 +659,16 @@ class ChatGPTClient:
                 return False, f"HTTP {r.status_code}: {error_msg}"
                 
         except Exception as e:
+            self._last_register_outcome = "network_timeout" if self._is_timeout_error(e) else "network_error"
             self._log(f"注册异常: {e}")
+            probe_state = self._probe_auth_state(
+                f"{self.AUTH}/email-verification",
+                referer=f"{self.AUTH}/create-account/password",
+            )
+            if probe_state and not self._state_is_password_registration(probe_state):
+                self.last_registration_state = probe_state
+                self._log(f"注册请求异常后状态已推进，按注册成功继续: {describe_flow_state(probe_state)}")
+                return True, "注册成功"
             return False, str(e)
     
     def send_email_otp(self):
@@ -638,8 +720,12 @@ class ChatGPTClient:
         payload = {"code": otp_code}
         
         try:
+            self._last_otp_validation_status_code = None
+            self._last_otp_validation_outcome = ""
             self._browser_pause()
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            self._last_otp_validation_status_code = int(r.status_code)
+            self._last_otp_validation_outcome = "success" if r.status_code == 200 else "http_non_200"
             
             if r.status_code == 200:
                 try:
@@ -654,11 +740,30 @@ class ChatGPTClient:
                     error_msg = r.text[:200]
                 except Exception:
                     error_msg = ""
+                probe_state = self._probe_auth_state(
+                    f"{self.AUTH}/email-verification",
+                    referer=f"{self.AUTH}/email-verification",
+                )
+                if probe_state and not self._state_is_email_otp(probe_state):
+                    self.last_registration_state = probe_state
+                    self._last_otp_validation_outcome = "success"
+                    self._log(f"OTP 接口返回异常但状态已推进，按验证成功继续: {describe_flow_state(probe_state)}")
+                    return (True, probe_state) if return_state else (True, "验证成功")
                 self._log(f"验证失败: {r.status_code} - {error_msg}")
                 return False, f"HTTP {r.status_code}: {error_msg}".strip()
                 
         except Exception as e:
+            self._last_otp_validation_outcome = "network_timeout" if self._is_timeout_error(e) else "network_error"
             self._log(f"验证异常: {e}")
+            probe_state = self._probe_auth_state(
+                f"{self.AUTH}/email-verification",
+                referer=f"{self.AUTH}/email-verification",
+            )
+            if probe_state and not self._state_is_email_otp(probe_state):
+                self.last_registration_state = probe_state
+                self._last_otp_validation_outcome = "success"
+                self._log(f"OTP 请求异常后状态已推进，按验证成功继续: {describe_flow_state(probe_state)}")
+                return (True, probe_state) if return_state else (True, "验证成功")
             return False, str(e)
     
     def create_account(self, first_name, last_name, birthdate, return_state=False):
@@ -819,8 +924,16 @@ class ChatGPTClient:
                 self._log("全新注册流程")
                 if register_submitted:
                     return False, "注册密码阶段重复进入"
-                success, msg = self.register_user(email, password)
-                if not success:
+                success = False
+                msg = ""
+                for register_attempt in range(3):
+                    success, msg = self.register_user(email, password)
+                    if success:
+                        break
+                    if self._last_register_outcome in {"network_timeout", "network_error"} and register_attempt < 2:
+                        self._log(f"注册提交遇到网络异常，重试同一请求 {register_attempt + 2}/3 ...")
+                        time.sleep(2)
+                        continue
                     return False, f"注册失败: {msg}"
                 register_submitted = True
                 if not self.send_email_otp():
@@ -844,6 +957,10 @@ class ChatGPTClient:
                         break
 
                     err_text = str(next_state or "")
+                    if self._last_otp_validation_outcome in {"network_timeout", "network_error"}:
+                        self._log("验证码提交遇到网络异常，重试同一码...")
+                        time.sleep(2)
+                        continue
                     is_wrong_code = any(
                         marker in err_text.lower()
                         for marker in (

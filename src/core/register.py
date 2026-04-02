@@ -20,6 +20,8 @@ from curl_cffi import requests as cffi_requests
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from .anyauto.register_flow import AnyAutoRegistrationEngine
+from .anyauto.sentinel_token import build_sentinel_token
+from .anyauto.utils import generate_datadog_trace
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
 from ..database.session import get_db
@@ -738,17 +740,19 @@ class RegistrationEngine:
                 is_existing = page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
                 if is_existing:
                     self._otp_sent_at = time.time()
-                    try:
-                        self.session.get(
-                            "https://auth.openai.com/email-verification",
-                            headers={
-                                "referer": "https://auth.openai.com/log-in/password",
-                                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            },
-                            timeout=15,
-                        )
-                    except Exception as e:
-                        self._log(f"登录验证码页预热失败: {e}", "warning")
+                    cookie_store = getattr(self.session, "cookies", None)
+                    if hasattr(cookie_store, "jar"):
+                        try:
+                            self.session.get(
+                                "https://auth.openai.com/email-verification",
+                                headers={
+                                    "referer": "https://auth.openai.com/log-in/password",
+                                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                },
+                                timeout=15,
+                            )
+                        except Exception as e:
+                            self._log(f"登录验证码页预热失败: {e}", "warning")
                     self._log("登录密码校验通过，等待系统自动发送的验证码")
 
                 return SignupFormResult(
@@ -1507,11 +1511,32 @@ class RegistrationEngine:
 
         continue_url = ""
         otp_continue = str(self._last_validate_otp_continue_url or "").strip()
+        otp_continue_lower = otp_continue.lower()
+        cached_continue = str(self._create_account_continue_url or "").strip()
+        cached_continue_lower = cached_continue.lower()
+        create_account_page_type = str(self._create_account_page_type or "").strip().lower()
+        add_phone_hit = any(
+            (
+                "auth.openai.com/add-phone" in otp_continue_lower,
+                "auth.openai.com/add-phone" in cached_continue_lower,
+                create_account_page_type == "add_phone",
+            )
+        )
+        if add_phone_hit:
+            result.account_id = result.account_id or str(self._create_account_account_id or "").strip()
+            result.workspace_id = result.workspace_id or str(workspace_id or self._create_account_workspace_id or "").strip()
+            result.refresh_token = result.refresh_token or str(self._create_account_refresh_token or "").strip()
+            result.password = self.password or ""
+            result.source = "register"
+            result.device_id = result.device_id or str(self.device_id or "")
+            result.error_message = "命中 add-phone 风控页，需要手机号验证，当前无法继续获取 token"
+            self._log("检测到 add-phone 风控页：OpenAI 当前要求补手机号，这不是单纯的网络超时", "warning")
+            return False
+
         if otp_continue and _is_registration_gate_url(otp_continue):
             self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
             otp_continue = ""
 
-        cached_continue = str(self._create_account_continue_url or "").strip()
         if cached_continue and _is_registration_gate_url(cached_continue):
             self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
             cached_continue = ""
@@ -2139,6 +2164,168 @@ class RegistrationEngine:
             self._last_register_password_error = str(e)
             return False, None
 
+    def _register_password(self, did: Optional[str] = None, sen_token: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """注册密码。"""
+
+        def _is_timeout_error(exc: Exception) -> bool:
+            text = str(exc or "").lower()
+            return any(
+                marker in text
+                for marker in (
+                    "timed out",
+                    "timeout",
+                    "curl: (28)",
+                    "operation timed out",
+                )
+            )
+
+        def _is_transient_network_error(exc: Exception) -> bool:
+            text = str(exc or "").lower()
+            if _is_timeout_error(exc):
+                return True
+            return any(
+                marker in text
+                for marker in (
+                    "failed to perform",
+                    "connection reset",
+                    "connection aborted",
+                    "connection refused",
+                    "network is unreachable",
+                    "recv failure",
+                    "send failure",
+                    "ssl",
+                    "tls",
+                    "proxy connect aborted",
+                )
+            )
+
+        def _probe_register_progress() -> bool:
+            probe_url = "https://auth.openai.com/email-verification"
+            try:
+                probe_response = self.session.get(
+                    probe_url,
+                    headers={
+                        "referer": "https://auth.openai.com/create-account/password",
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    },
+                    allow_redirects=True,
+                    timeout=15,
+                )
+                final_url = str(getattr(probe_response, "url", "") or probe_url).strip()
+                final_url_lower = final_url.lower()
+                self._log(
+                    f"密码注册异常后状态探测: {probe_response.status_code} {final_url[:120]}..."
+                )
+                if "email-verification" in final_url_lower or "email-otp" in final_url_lower:
+                    return True
+                if "about-you" in final_url_lower or "add-phone" in final_url_lower:
+                    return True
+                return False
+            except Exception as probe_error:
+                self._log(f"密码注册状态探测失败: {probe_error}", "warning")
+                return False
+
+        self._last_register_password_error = None
+        password = self._generate_password()
+        self.password = password
+        self._log(f"生成密码: {password}")
+
+        payload = {
+            "password": password,
+            "username": self.email,
+        }
+        request_headers = {
+            "referer": "https://auth.openai.com/create-account/password",
+            "origin": "https://auth.openai.com",
+            "accept": "application/json",
+            "content-type": "application/json",
+            "sec-fetch-site": "same-origin",
+        }
+        request_headers.update(generate_datadog_trace())
+
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.session.post(
+                    OPENAI_API_ENDPOINTS["register"],
+                    headers=request_headers,
+                    json=payload,
+                    timeout=45,
+                )
+
+                self._log(f"提交密码状态: {response.status_code}")
+
+                if response.status_code == 200:
+                    return True, password
+
+                error_text = str(response.text or "")[:500]
+                self._log(f"密码注册失败: {error_text}", "warning")
+
+                try:
+                    error_json = response.json()
+                    error_msg = error_json.get("error", {}).get("message", "")
+                    error_code = error_json.get("error", {}).get("code", "")
+                    normalized_error_msg = str(error_msg or "").strip()
+                    normalized_error_code = str(error_code or "").strip()
+
+                    if "already" in normalized_error_msg.lower() or "exists" in normalized_error_msg.lower() or normalized_error_code == "user_exists":
+                        self._log(f"邮箱 {self.email} 可能已在 OpenAI 注册过", "error")
+                        self._mark_email_as_registered()
+                        self._last_register_password_error = "该邮箱可能已在 OpenAI 注册，建议更换邮箱或改走登录流程"
+                    elif "failed to register username" in normalized_error_msg.lower():
+                        self._last_register_password_error = (
+                            "OpenAI 拒绝当前邮箱用户名（可能已占用或触发风控），建议更换邮箱后重试"
+                        )
+                        if did:
+                            self._log("检测到用户名注册失败，尝试登录入口探测邮箱是否已存在...", "warning")
+                            try:
+                                probe = self._submit_login_start(did, sen_token)
+                                if probe.success and probe.page_type in (
+                                    OPENAI_PAGE_TYPES["LOGIN_PASSWORD"],
+                                    OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
+                                ):
+                                    self._log("登录入口探测命中：该邮箱大概率已是 OpenAI 账号", "warning")
+                                    self._last_register_password_error = (
+                                        "该邮箱已存在 OpenAI 账号。若是刚刚注册中断，请优先使用上一轮任务日志里的“生成密码”继续登录。"
+                                    )
+                            except Exception as probe_error:
+                                self._log(f"登录入口探测失败: {probe_error}", "warning")
+                    else:
+                        self._last_register_password_error = (
+                            f"注册密码接口返回异常: {normalized_error_msg or f'HTTP {response.status_code}'}"
+                        )
+                except Exception:
+                    self._last_register_password_error = f"注册密码接口返回异常: HTTP {response.status_code}"
+
+                if response.status_code in {409, 429, 500, 502, 503, 504} and attempt < max_attempts:
+                    self._log(
+                        f"密码注册第 {attempt}/{max_attempts} 次返回 HTTP {response.status_code}，重试同一请求...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False, None
+
+            except Exception as e:
+                self._log(f"密码注册失败: {e}", "error")
+
+                if _probe_register_progress():
+                    self._log("密码注册请求异常后状态已推进，按注册成功继续", "warning")
+                    return True, password
+
+                if _is_transient_network_error(e) and attempt < max_attempts:
+                    self._log(
+                        f"密码注册第 {attempt}/{max_attempts} 次遇到网络异常，重试同一请求...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+
+                self._last_register_password_error = str(e)
+                return False, None
+
+        return False, None
+
     def _mark_email_as_registered(self):
         """标记邮箱为已注册状态（用于防止重复尝试）"""
         try:
@@ -2373,6 +2560,110 @@ class RegistrationEngine:
 
         return False
 
+    def _verify_email_otp_with_retry(
+        self,
+        stage_label: str = "验证码",
+        max_attempts: int = 3,
+        fetch_timeout: Optional[int] = None,
+        attempted_codes: Optional[set[str]] = None,
+    ) -> bool:
+        """
+        获取并校验邮箱验证码，支持两类重试：
+        1. 拉取到旧验证码时，继续等待下一封邮件；
+        2. 向 OpenAI 校验验证码时遇到网络超时/网络错误，直接重试同一个验证码。
+        """
+        self._last_validate_otp_continue_url = None
+        self._last_validate_otp_workspace_id = None
+        if attempted_codes is None:
+            attempted_codes = set()
+
+        def _is_login_stage() -> bool:
+            if not stage_label:
+                return False
+            stage_label_lower = stage_label.lower()
+            return (
+                "登录验证码" in stage_label
+                or "login" in stage_label_lower
+                or "会话桥接" in stage_label
+            )
+
+        def _validate_same_code_with_network_retry(code: str, attempt: int) -> bool:
+            same_code_attempt = 0
+            max_same_code_attempts = 2
+
+            while same_code_attempt < max_same_code_attempts:
+                same_code_attempt += 1
+                if self._validate_verification_code(code):
+                    if _is_login_stage():
+                        self._touch_otp_continue_url(stage_label)
+                    return True
+
+                if self._last_otp_validation_outcome not in {"network_timeout", "network_error"}:
+                    return False
+
+                if same_code_attempt >= max_same_code_attempts:
+                    return False
+
+                self._log(
+                    f"{stage_label}第 {attempt}/{max_attempts} 次校验遇到网络异常"
+                    f"（{self._last_otp_validation_outcome}），直接重试同一码 {code}...",
+                    "warning",
+                )
+                time.sleep(2)
+
+            return False
+
+        for attempt in range(1, max_attempts + 1):
+            code = (
+                self._get_verification_code(timeout=fetch_timeout)
+                if fetch_timeout
+                else self._get_verification_code()
+            )
+            if not code:
+                if attempt < max_attempts:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次未取到验证码，稍后重试...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+            allow_duplicate_retry = (
+                code in attempted_codes
+                and self._last_otp_validation_code == code
+                and self._last_otp_validation_outcome in {"network_timeout", "network_error"}
+            )
+            if code in attempted_codes and not allow_duplicate_retry:
+                if attempt < max_attempts:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次命中重复验证码 {code}，等待新邮件...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+            attempted_codes.add(code)
+
+            if _validate_same_code_with_network_retry(code, attempt):
+                return True
+
+            if attempt < max_attempts:
+                if self._last_otp_validation_outcome in {"network_timeout", "network_error"}:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次同一码重试后仍然网络异常，继续等待后续验证码...",
+                        "warning",
+                    )
+                else:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次校验未通过，疑似旧验证码，自动重试下一封...",
+                        "warning",
+                    )
+                time.sleep(2)
+
+        return False
+
     def _create_user_account(self) -> bool:
         """创建用户账户"""
         try:
@@ -2478,6 +2769,285 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"创建账户失败: {e}", "error")
             return False
+
+    def _create_user_account(self) -> bool:
+        """创建用户账户。"""
+
+        def _is_timeout_error(exc: Exception) -> bool:
+            text = str(exc or "").lower()
+            return any(
+                marker in text
+                for marker in (
+                    "timed out",
+                    "timeout",
+                    "curl: (28)",
+                    "operation timed out",
+                )
+            )
+
+        def _is_transient_network_error(exc: Exception) -> bool:
+            text = str(exc or "").lower()
+            if _is_timeout_error(exc):
+                return True
+            return any(
+                marker in text
+                for marker in (
+                    "failed to perform",
+                    "connection reset",
+                    "connection aborted",
+                    "connection refused",
+                    "network is unreachable",
+                    "recv failure",
+                    "send failure",
+                    "ssl",
+                    "tls",
+                    "proxy connect aborted",
+                )
+            )
+
+        def _cache_create_account_response(response, log_prefix: str) -> None:
+            response_text = ""
+            response_url = str(getattr(response, "url", "") or "").strip()
+            try:
+                response_text = str(response.text or "")
+            except Exception:
+                response_text = ""
+
+            if response_url:
+                response_url_lower = response_url.lower()
+                if "/api/auth/callback/openai" in response_url_lower and "code=" in response_url_lower:
+                    self._create_account_callback_url = response_url
+                    self._log(f"{log_prefix}命中 OAuth callback，已缓存")
+                elif "auth.openai.com/add-phone" in response_url_lower:
+                    self._create_account_page_type = "add_phone"
+                    self._log(f"{log_prefix}当前落在 add-phone: {response_url[:100]}...")
+                elif "auth.openai.com/about-you" in response_url_lower:
+                    self._create_account_page_type = "about_you"
+
+            data = {}
+            try:
+                data = response.json() or {}
+            except Exception:
+                data = {}
+
+            if not isinstance(data, dict):
+                data = {}
+
+            continue_url = str(data.get("continue_url") or "").strip()
+            if continue_url:
+                self._create_account_continue_url = continue_url
+                self._log(f"{log_prefix}返回 continue_url，已缓存: {continue_url[:100]}...")
+                if "/api/auth/callback/openai" in continue_url and "code=" in continue_url:
+                    self._create_account_callback_url = continue_url
+                    self._log(f"{log_prefix}返回 OAuth callback（含 code），将优先走直连会话交换")
+
+            page_info = data.get("page") if isinstance(data, dict) else None
+            if isinstance(page_info, dict):
+                page_type = str(page_info.get("type") or "").strip()
+                if page_type:
+                    self._create_account_page_type = page_type
+                    self._log(f"{log_prefix}返回 page.type: {page_type}")
+                page_url = str(
+                    page_info.get("url")
+                    or page_info.get("href")
+                    or page_info.get("external_url")
+                    or ""
+                ).strip()
+                if page_url:
+                    self._log(f"{log_prefix}返回 page.url: {page_url[:100]}...")
+                    if "/api/auth/callback/openai" in page_url and "code=" in page_url:
+                        self._create_account_callback_url = page_url
+                        self._log(f"{log_prefix}返回 OAuth callback（page.url），将优先走直连会话交换")
+
+            if not self._create_account_callback_url:
+                try:
+                    haystacks = [response_text, json.dumps(data, ensure_ascii=False), response_url]
+                    for raw in haystacks:
+                        if not raw:
+                            continue
+                        match = re.search(
+                            r"https://chatgpt\.com/api/auth/callback/openai\?[^\"'\\s>]+",
+                            raw,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            self._create_account_callback_url = match.group(0)
+                            self._log(f"{log_prefix}响应体命中 OAuth callback，已缓存")
+                            break
+                except Exception:
+                    pass
+
+            account_id = str(
+                data.get("account_id")
+                or data.get("chatgpt_account_id")
+                or (data.get("account") or {}).get("id")
+                or ""
+            ).strip()
+            if account_id:
+                self._create_account_account_id = account_id
+                self._log(f"{log_prefix}返回 account_id，已缓存: {account_id}")
+
+            workspace_id = str(
+                data.get("workspace_id")
+                or data.get("default_workspace_id")
+                or (data.get("workspace") or {}).get("id")
+                or ""
+            ).strip()
+            if (not workspace_id) and isinstance(data.get("workspaces"), list) and data.get("workspaces"):
+                workspace_id = str((data.get("workspaces")[0] or {}).get("id") or "").strip()
+            if workspace_id:
+                self._create_account_workspace_id = workspace_id
+                self._log(f"{log_prefix}返回 workspace_id，已缓存: {workspace_id}")
+
+            refresh_token = str(data.get("refresh_token") or "").strip()
+            if refresh_token:
+                self._create_account_refresh_token = refresh_token
+                self._log(f"{log_prefix}返回 refresh_token，已缓存")
+
+        def _probe_create_account_progress() -> bool:
+            probe_url = "https://auth.openai.com/about-you"
+            try:
+                probe_response = self.session.get(
+                    probe_url,
+                    headers={
+                        "referer": "https://auth.openai.com/about-you",
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    },
+                    allow_redirects=True,
+                    timeout=15,
+                )
+                final_url = str(getattr(probe_response, "url", "") or probe_url).strip()
+                self._log(
+                    f"create_account 异常后状态探测: {probe_response.status_code} {final_url[:120]}..."
+                )
+                _cache_create_account_response(probe_response, "create_account 状态探测")
+
+                final_url_lower = final_url.lower()
+                if "/api/auth/callback/openai" in final_url_lower and "code=" in final_url_lower:
+                    return True
+                if "chatgpt.com/" in final_url_lower and "auth.openai.com/about-you" not in final_url_lower:
+                    return True
+                if "auth.openai.com/add-phone" in final_url_lower:
+                    return True
+
+                if self._create_account_callback_url:
+                    return True
+                if self._create_account_page_type and self._create_account_page_type not in {"about_you", ""}:
+                    return True
+
+                return False
+            except Exception as probe_error:
+                self._log(f"create_account 状态探测失败: {probe_error}", "warning")
+                return False
+
+        user_info = generate_random_user_info()
+        self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
+
+        request_did = str(self.device_id or "").strip()
+        if not request_did:
+            try:
+                request_did = str(self.session.cookies.get("oai-did") or "").strip()
+            except Exception:
+                request_did = ""
+        if not request_did:
+            request_did = str(uuid.uuid4())
+            self.device_id = request_did
+            try:
+                self.session.cookies.set("oai-did", request_did, domain=".chatgpt.com", path="/")
+            except Exception:
+                pass
+            try:
+                self.session.cookies.set("oai-did", request_did, domain=".auth.openai.com", path="/")
+            except Exception:
+                pass
+
+        session_headers = getattr(self.session, "headers", {}) or {}
+        user_agent = str(
+            session_headers.get("User-Agent")
+            or session_headers.get("user-agent")
+            or (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+            )
+        ).strip()
+        sec_ch_ua = str(
+            session_headers.get("sec-ch-ua")
+            or session_headers.get("Sec-CH-UA")
+            or "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\""
+        ).strip()
+
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                sentinel_token = build_sentinel_token(
+                    self.session,
+                    request_did,
+                    flow="authorize_continue",
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                )
+                request_headers = {
+                    "referer": "https://auth.openai.com/about-you",
+                    "origin": "https://auth.openai.com",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "sec-fetch-site": "same-origin",
+                    "oai-device-id": request_did,
+                }
+                if sentinel_token:
+                    request_headers["openai-sentinel-token"] = sentinel_token
+                request_headers.update(generate_datadog_trace())
+
+                response = self.session.post(
+                    OPENAI_API_ENDPOINTS["create_account"],
+                    headers=request_headers,
+                    json=user_info,
+                    timeout=45,
+                )
+
+                self._log(f"账户创建状态: {response.status_code}")
+
+                if response.status_code == 200:
+                    _cache_create_account_response(response, "create_account")
+                    return True
+
+                response_text = ""
+                try:
+                    response_text = str(response.text or "")[:200]
+                except Exception:
+                    response_text = ""
+                self._log(f"账户创建失败: {response_text}", "warning")
+
+                if _probe_create_account_progress():
+                    self._log("create_account 接口虽然未正常返回，但状态已经推进，按创建成功继续", "warning")
+                    return True
+
+                if response.status_code in {409, 429, 500, 502, 503, 504} and attempt < max_attempts:
+                    self._log(
+                        f"create_account 第 {attempt}/{max_attempts} 次返回 HTTP {response.status_code}，重试同一请求...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+            except Exception as e:
+                self._log(f"创建账户失败: {e}", "error")
+
+                if _probe_create_account_progress():
+                    self._log("create_account 请求异常后状态已推进，按创建成功继续", "warning")
+                    return True
+
+                if _is_transient_network_error(e) and attempt < max_attempts:
+                    self._log(
+                        f"create_account 第 {attempt}/{max_attempts} 次遇到网络异常，重试同一请求...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+        return False
 
     def _decode_jwt_payload(self, token: str) -> Dict[str, Any]:
         """解析 JWT payload（不验证签名）。"""
@@ -2900,10 +3470,171 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
-    def run(self) -> RegistrationResult:
+    @staticmethod
+    def _extract_account_id_from_token_text(token: str) -> str:
+        try:
+            text = str(token or "").strip()
+            if "." not in text:
+                return ""
+            payload_part = text.split(".")[1]
+            pad = "=" * (-len(payload_part) % 4)
+            import base64
+            import json as _json
+
+            decoded = base64.urlsafe_b64decode(payload_part + pad).decode("utf-8")
+            payload = _json.loads(decoded)
+            if not isinstance(payload, dict):
+                return ""
+
+            auth_claims = payload.get("https://api.openai.com/auth") or {}
+            for key in ("chatgpt_account_id", "account_id", "workspace_id"):
+                value = str(auth_claims.get(key) or payload.get(key) or "").strip()
+                if value:
+                    return value
+        except Exception:
+            return ""
+        return ""
+
+    def _build_result_metadata(self, *, registration_flow: str, token_acquired_via_relogin: bool) -> Dict[str, Any]:
+        return {
+            "email_service": self.email_service.service_type.value,
+            "proxy_used": self.proxy_url,
+            "registered_at": datetime.now().isoformat(),
+            "registration_flow": registration_flow,
+            "token_acquired_via_relogin": bool(token_acquired_via_relogin),
+        }
+
+    def _run_native_registration(self) -> RegistrationResult:
         """
-        执行 any-auto-register 风格的注册流程
+        Run the original native registration flow.
+
+        This path respects `registration_entry_flow=native` and uses the
+        built-in registration / relogin helpers already present in this class.
         """
+        result = RegistrationResult(success=False, logs=self.logs)
+        result.source = "register"
+
+        try:
+            if not self._create_email():
+                result.error_message = "创建邮箱失败"
+                return result
+
+            result.email = self.email or ""
+
+            did, sen_token = self._prepare_authorize_flow("注册")
+            if not did:
+                result.error_message = "获取 Device ID 失败"
+                return result
+            if not sen_token:
+                result.error_message = "Sentinel POW 验证失败"
+                return result
+
+            signup_result = self._submit_signup_form(did, sen_token)
+            if not signup_result.success:
+                result.error_message = signup_result.error_message or "提交注册表单失败"
+                return result
+
+            result.device_id = str(self.device_id or did or "")
+
+            # Existing-account path: OTP is typically auto-sent by OpenAI after login start.
+            if signup_result.is_existing_account:
+                complete_ok = (
+                    self._complete_token_exchange_outlook(result)
+                    if self.email_service.service_type == EmailServiceType.OUTLOOK
+                    else self._complete_token_exchange_native_backup(result)
+                )
+                if not complete_ok:
+                    return result
+
+                result.success = True
+                result.email = self.email or result.email
+                result.password = self.password or result.password
+                result.device_id = result.device_id or str(self.device_id or "")
+                result.metadata = self._build_result_metadata(
+                    registration_flow="native",
+                    token_acquired_via_relogin=False,
+                )
+                return result
+
+            password_ok, _password = self._register_password(did, sen_token)
+            if not password_ok:
+                result.error_message = self._last_register_password_error or "注册密码失败"
+                return result
+
+            result.password = self.password or ""
+
+            if not self._send_verification_code():
+                self._log("发送注册验证码接口失败，继续等待邮箱中的验证码...", "warning")
+
+            if not self._verify_email_otp_with_retry(stage_label="注册验证码", max_attempts=3):
+                result.error_message = "验证码校验失败"
+                return result
+
+            if not self._create_user_account():
+                result.error_message = "创建账号失败"
+                return result
+
+            result.source = "register"
+            result.password = self.password or ""
+            result.device_id = result.device_id or str(self.device_id or "")
+
+            direct_capture_ok = False
+            native_capture_hints = any(
+                (
+                    str(self._create_account_callback_url or "").strip(),
+                    str(self._create_account_continue_url or "").strip(),
+                    str(self._create_account_workspace_id or "").strip(),
+                    str(self._create_account_account_id or "").strip(),
+                    str(self._create_account_refresh_token or "").strip(),
+                )
+            )
+            if native_capture_hints:
+                if self._create_account_callback_url:
+                    direct_capture_ok = self._consume_create_account_callback(result)
+                if not direct_capture_ok:
+                    direct_capture_ok = self._capture_native_core_tokens(result)
+
+            if direct_capture_ok and self._ensure_native_required_tokens(result):
+                result.success = True
+                result.email = self.email or result.email
+                result.password = self.password or result.password
+                result.device_id = result.device_id or str(self.device_id or "")
+                result.metadata = self._build_result_metadata(
+                    registration_flow="native",
+                    token_acquired_via_relogin=False,
+                )
+                return result
+
+            login_ready, login_error = self._restart_login_flow()
+            if not login_ready:
+                result.error_message = login_error or "重新登录失败"
+                return result
+
+            complete_ok = (
+                self._complete_token_exchange_outlook(result)
+                if self.email_service.service_type == EmailServiceType.OUTLOOK
+                else self._complete_token_exchange_native_backup(result)
+            )
+            if not complete_ok:
+                return result
+
+            result.success = True
+            result.email = self.email or result.email
+            result.password = self.password or result.password
+            result.device_id = result.device_id or str(self.device_id or "")
+            result.metadata = self._build_result_metadata(
+                registration_flow="native",
+                token_acquired_via_relogin=True,
+            )
+            return result
+
+        except Exception as e:
+            self._log(f"原生注册流程发生未预期错误: {e}", "error")
+            result.error_message = str(e)
+            return result
+
+    def _run_anyauto_registration(self) -> RegistrationResult:
+        """Run the any-auto registration flow."""
         result = RegistrationResult(success=False, logs=self.logs)
         try:
             settings = get_settings()
@@ -2945,40 +3676,19 @@ class RegistrationEngine:
             result.workspace_id = flow_result.get("workspace_id", "") or ""
             result.source = "register"
 
-            def _extract_account_id_from_token(token: str) -> str:
-                try:
-                    text = str(token or "").strip()
-                    if "." not in text:
-                        return ""
-                    payload_part = text.split(".")[1]
-                    pad = "=" * (-len(payload_part) % 4)
-                    import base64, json as _json
-                    decoded = base64.urlsafe_b64decode(payload_part + pad).decode("utf-8")
-                    payload = _json.loads(decoded)
-                    if not isinstance(payload, dict):
-                        return ""
-                    auth_claims = payload.get("https://api.openai.com/auth") or {}
-                    for key in ("chatgpt_account_id", "account_id", "workspace_id"):
-                        value = str(auth_claims.get(key) or payload.get(key) or "").strip()
-                        if value:
-                            return value
-                except Exception:
-                    return ""
-                return ""
-
             if not result.account_id:
-                result.account_id = _extract_account_id_from_token(result.access_token or result.id_token)
+                result.account_id = self._extract_account_id_from_token_text(result.access_token or result.id_token)
             if not result.account_id and result.workspace_id:
                 result.account_id = result.workspace_id
             if not result.workspace_id and result.account_id:
                 result.workspace_id = result.account_id
 
             metadata = flow_result.get("metadata") or {}
+            metadata.update(self._build_result_metadata(
+                registration_flow="any-auto-register",
+                token_acquired_via_relogin=False,
+            ))
             metadata.update({
-                "email_service": self.email_service.service_type.value,
-                "proxy_used": self.proxy_url,
-                "registered_at": datetime.now().isoformat(),
-                "registration_flow": "any-auto-register",
                 "has_session_token": bool(result.session_token),
                 "has_access_token": bool(result.access_token),
             })
@@ -2990,6 +3700,14 @@ class RegistrationEngine:
             self._log(f"注册过程中发生未预期错误: {e}", "error")
             result.error_message = str(e)
             return result
+
+    def run(self) -> RegistrationResult:
+        """
+        Execute the configured registration flow.
+        """
+        if self.registration_entry_flow == "native":
+            return self._run_native_registration()
+        return self._run_anyauto_registration()
     def save_to_database(self, result: RegistrationResult) -> bool:
         """
         保存注册结果到数据库
