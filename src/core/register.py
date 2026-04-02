@@ -802,10 +802,18 @@ class RegistrationEngine:
 
             except Exception as e:
                 if attempt < max_attempts:
-                    self._log(
-                        f"提交登录密码异常（第 {attempt}/{max_attempts} 次）: {e}，准备重试...",
-                        "warning",
-                    )
+                    err_lower = str(e or "").lower()
+                    if "timed out" in err_lower or "timeout" in err_lower or "curl: (28)" in err_lower:
+                        self._log(
+                            f"提交登录密码超时（第 {attempt}/{max_attempts} 次），重建会话后重试...",
+                            "warning",
+                        )
+                        self._rebuild_session()
+                    else:
+                        self._log(
+                            f"提交登录密码异常（第 {attempt}/{max_attempts} 次）: {e}，准备重试...",
+                            "warning",
+                        )
                     time.sleep(2 * attempt)
                     continue
                 self._log(f"提交登录密码失败: {e}", "error")
@@ -2852,15 +2860,19 @@ class RegistrationEngine:
 
         except Exception as e:
             err_text = str(e or "").lower()
-            if (
+            is_timeout = (
                 "timed out" in err_text
                 or "timeout" in err_text
                 or "curl: (28)" in err_text
                 or "operation timed out" in err_text
-            ):
+            )
+            if is_timeout:
                 self._last_otp_validation_outcome = "network_timeout"
+                self._log("[validate_otp] 请求超时，重建会话后探测状态...", "warning")
+                self._rebuild_session()
             else:
                 self._last_otp_validation_outcome = "network_error"
+                self._log(f"[validate_otp] 请求异常: {e}", "error")
 
             progressed, reason = self._probe_otp_validation_progress()
             self._last_otp_validation_reason = reason
@@ -3588,7 +3600,8 @@ class RegistrationEngine:
             ):
                 self._last_send_otp_outcome = "timeout_assumed_sent"
                 self._last_send_otp_reason = "send_otp timeout, assume OTP already sent"
-                self._log("发送验证码接口超时，但验证码大概率已经发出，继续等待邮箱", "warning")
+                self._log("发送验证码接口超时，重建会话；验证码大概率已发出，继续等待邮箱", "warning")
+                self._rebuild_session()
                 return True
 
             self._last_send_otp_outcome = "network_error"
@@ -4042,14 +4055,17 @@ class RegistrationEngine:
             return ""
         return ""
 
-    def _build_result_metadata(self, *, registration_flow: str, token_acquired_via_relogin: bool) -> Dict[str, Any]:
-        return {
+    def _build_result_metadata(self, *, registration_flow: str, token_acquired_via_relogin: bool, **extra) -> Dict[str, Any]:
+        meta = {
             "email_service": self.email_service.service_type.value,
             "proxy_used": self.proxy_url,
             "registered_at": datetime.now().isoformat(),
             "registration_flow": registration_flow,
             "token_acquired_via_relogin": bool(token_acquired_via_relogin),
         }
+        if extra:
+            meta.update(extra)
+        return meta
 
     def _run_native_registration(self) -> RegistrationResult:
         """
@@ -4141,6 +4157,10 @@ class RegistrationEngine:
                 if not direct_capture_ok:
                     direct_capture_ok = self._capture_native_core_tokens(result)
 
+            if not direct_capture_ok:
+                self._log("create_account 未返回 callback/token 信息，尝试用当前会话直接抓取 token（避免重登录触发风控）...", "warning")
+                direct_capture_ok = self._capture_native_core_tokens(result)
+
             if direct_capture_ok and self._ensure_native_required_tokens(result):
                 result.success = True
                 result.email = self.email or result.email
@@ -4152,6 +4172,7 @@ class RegistrationEngine:
                 )
                 return result
 
+            self._log("当前会话直接抓取 token 未成功，回退到重登录链路...", "warning")
             login_ready, login_error = self._restart_login_flow()
             if not login_ready:
                 result.error_message = login_error or "重新登录失败"
@@ -4163,6 +4184,19 @@ class RegistrationEngine:
                 else self._complete_token_exchange_native_backup(result)
             )
             if not complete_ok:
+                err_msg = str(result.error_message or "").lower()
+                if "add-phone" in err_msg or "add_phone" in err_msg:
+                    self._log("重登录命中 add-phone 风控页，但账号已注册成功（邮箱+密码有效），按部分成功保存", "warning")
+                    result.success = True
+                    result.email = self.email or result.email
+                    result.password = self.password or result.password
+                    result.device_id = result.device_id or str(self.device_id or "")
+                    result.error_message = "add-phone 风控：账号已创建，token 待后续获取"
+                    result.metadata = self._build_result_metadata(
+                        registration_flow="native",
+                        token_acquired_via_relogin=False,
+                        add_phone_blocked=True,
+                    )
                 return result
 
             result.success = True
