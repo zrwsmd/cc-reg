@@ -30,6 +30,30 @@ class FakeHTTPClient:
         return self.responses.pop(0)
 
 
+def test_create_email_normalizes_base_url_before_request():
+    service = TempMailService({
+        "base_url": " mail.example.com/ ",
+        "admin_password": "admin-secret",
+        "domain": "@example.com ",
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "address": "tester@example.com",
+                "jwt": "jwt-abc",
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    email_info = service.create_email()
+
+    assert service.config["base_url"] == "https://mail.example.com"
+    assert service.config["domain"] == "example.com"
+    assert email_info["email"] == "tester@example.com"
+    assert fake_client.calls[0]["url"] == "https://mail.example.com/admin/new_address"
+
+
 def test_get_verification_code_fallbacks_to_admin_when_user_endpoints_fail():
     service = TempMailService({
         "base_url": "https://mail.example.com",

@@ -14,6 +14,7 @@ from ...database.session import get_db
 from ...database.models import EmailService as EmailServiceModel
 from ...database.models import Account as AccountModel
 from ...config.settings import get_settings
+from ...core.url_utils import normalize_base_url
 from ...services import EmailServiceFactory, EmailServiceType
 
 logger = logging.getLogger(__name__)
@@ -119,12 +120,50 @@ def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return filtered
 
 
+def _normalize_email_service_config(service_type: Optional[str], config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize service config before persisting it."""
+    normalized = dict(config or {})
+
+    if "api_url" in normalized and "base_url" not in normalized:
+        normalized["base_url"] = normalized.pop("api_url")
+
+    if "base_url" in normalized:
+        try:
+            normalized["base_url"] = normalize_base_url(normalized["base_url"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    for key in ("domain", "default_domain", "preferred_domain", "email"):
+        value = normalized.get(key)
+        if isinstance(value, str):
+            normalized[key] = value.strip()
+
+    if service_type in {"temp_mail", "freemail", "cloudmail"} and isinstance(normalized.get("domain"), str):
+        normalized["domain"] = normalized["domain"].lstrip("@")
+
+    if service_type in {"duck_mail", "moe_mail", "yyds_mail"} and isinstance(normalized.get("default_domain"), str):
+        normalized["default_domain"] = normalized["default_domain"].lstrip("@")
+
+    if service_type == "luckmail" and isinstance(normalized.get("preferred_domain"), str):
+        normalized["preferred_domain"] = normalized["preferred_domain"].lstrip("@")
+
+    return normalized
+
+
+def _normalize_email_service_config_safe(service_type: Optional[str], config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    try:
+        return _normalize_email_service_config(service_type, config)
+    except HTTPException:
+        return dict(config or {})
+
+
 def service_to_response(service: EmailServiceModel) -> EmailServiceResponse:
     """?????????"""
+    normalized_config = _normalize_email_service_config_safe(service.service_type, service.config)
     registration_status = None
     registered_account_id = None
     if service.service_type == "outlook":
-        email = str((service.config or {}).get("email") or service.name or "").strip()
+        email = str(normalized_config.get("email") or service.name or "").strip()
         normalized_email = email.lower()
         if email:
             with get_db() as db:
@@ -145,7 +184,7 @@ def service_to_response(service: EmailServiceModel) -> EmailServiceResponse:
         name=service.name,
         enabled=service.enabled,
         priority=service.priority,
-        config=filter_sensitive_config(service.config),
+        config=filter_sensitive_config(normalized_config),
         registration_status=registration_status,
         registered_account_id=registered_account_id,
         last_used=service.last_used.isoformat() if service.last_used else None,
@@ -366,13 +405,15 @@ async def get_email_service_full(service_id: int):
         if not service:
             raise HTTPException(status_code=404, detail="服务不存在")
 
+        normalized_config = _normalize_email_service_config_safe(service.service_type, service.config)
+
         return {
             "id": service.id,
             "service_type": service.service_type,
             "name": service.name,
             "enabled": service.enabled,
             "priority": service.priority,
-            "config": service.config or {},  # 返回完整配置
+            "config": normalized_config,  # 返回完整配置
             "last_used": service.last_used.isoformat() if service.last_used else None,
             "created_at": service.created_at.isoformat() if service.created_at else None,
             "updated_at": service.updated_at.isoformat() if service.updated_at else None,
@@ -394,10 +435,12 @@ async def create_email_service(request: EmailServiceCreate):
         if existing:
             raise HTTPException(status_code=400, detail="服务名称已存在")
 
+        normalized_config = _normalize_email_service_config(request.service_type, request.config)
+
         service = EmailServiceModel(
             service_type=request.service_type,
             name=request.name,
-            config=request.config,
+            config=normalized_config,
             enabled=request.enabled,
             priority=request.priority
         )
@@ -422,10 +465,13 @@ async def update_email_service(service_id: int, request: EmailServiceUpdate):
         if request.config is not None:
             # 合并配置而不是替换
             current_config = service.config or {}
-            merged_config = {**current_config, **request.config}
-            # 移除空值
-            merged_config = {k: v for k, v in merged_config.items() if v}
-            update_data["config"] = merged_config
+            incoming_config = {
+                k: v
+                for k, v in request.config.items()
+                if v is not None and not (isinstance(v, str) and not v.strip())
+            }
+            merged_config = {**current_config, **incoming_config}
+            update_data["config"] = _normalize_email_service_config(service.service_type, merged_config)
         if request.enabled is not None:
             update_data["enabled"] = request.enabled
         if request.priority is not None:

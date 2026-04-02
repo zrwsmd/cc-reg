@@ -19,6 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..core.http_client import HTTPClient, RequestConfig
+from ..core.url_utils import normalize_base_url
 from ..config.constants import OTP_CODE_PATTERN, OTP_CODE_SEMANTIC_PATTERN
 
 OTP_DOMAIN_PATTERN = re.compile(r"@[A-Za-z0-9.-]+\.\d{6}(?!\d)")
@@ -61,6 +62,8 @@ class TempMailService(BaseEmailService):
             "max_retries": 3,
         }
         self.config = {**default_config, **(config or {})}
+        self.config["base_url"] = normalize_base_url(self.config["base_url"])
+        self.config["domain"] = str(self.config["domain"]).strip().lstrip("@")
 
         # 不走代理，proxy_url=None
         http_config = RequestConfig(
