@@ -424,6 +424,41 @@ class RegistrationEngine:
             self._log(f"初始化会话失败: {e}", "error")
             return False
 
+    def _rebuild_session(self) -> None:
+        """重建 curl 会话（保留 cookies），用于清除卡死的连接池。"""
+        try:
+            old_session = self.session
+            if not old_session:
+                return
+            saved_cookies = []
+            try:
+                for cookie in old_session.cookies.jar:
+                    saved_cookies.append(cookie)
+            except Exception:
+                try:
+                    for k, v in old_session.cookies.items():
+                        saved_cookies.append((k, v))
+                except Exception:
+                    pass
+            try:
+                old_session.close()
+            except Exception:
+                pass
+            self.http_client._session = None
+            self.session = self.http_client.session
+            for cookie in saved_cookies:
+                try:
+                    if hasattr(cookie, "name"):
+                        self.session.cookies.jar.set_cookie(cookie)
+                    else:
+                        k, v = cookie
+                        self.session.cookies.set(k, v)
+                except Exception:
+                    pass
+            self._log("已重建 HTTP 会话（清除卡死连接池）")
+        except Exception as rebuild_err:
+            self._log(f"重建会话失败: {rebuild_err}", "warning")
+
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID"""
         if not self.oauth_start:
@@ -3309,12 +3344,18 @@ class RegistrationEngine:
         def _probe_create_account_progress() -> bool:
             probe_url = "https://auth.openai.com/about-you"
             try:
+                probe_headers = {
+                    "referer": "https://auth.openai.com/about-you",
+                    "origin": "https://auth.openai.com",
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "sec-fetch-site": "same-origin",
+                }
+                _did = str(self.device_id or "").strip()
+                if _did:
+                    probe_headers["oai-device-id"] = _did
                 probe_response = self.session.get(
                     probe_url,
-                    headers={
-                        "referer": "https://auth.openai.com/about-you",
-                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    },
+                    headers=probe_headers,
                     allow_redirects=True,
                     timeout=15,
                 )
@@ -3327,14 +3368,16 @@ class RegistrationEngine:
                 final_url_lower = final_url.lower()
                 if "/api/auth/callback/openai" in final_url_lower and "code=" in final_url_lower:
                     return True
-                if "chatgpt.com/" in final_url_lower and "auth.openai.com/about-you" not in final_url_lower:
+                if "chatgpt.com/" in final_url_lower and "auth.openai.com" not in final_url_lower:
                     return True
                 if "auth.openai.com/add-phone" in final_url_lower:
+                    return True
+                if "auth.openai.com/about-you" in final_url_lower and probe_response.status_code == 200:
                     return True
 
                 if self._create_account_callback_url:
                     return True
-                if self._create_account_page_type and self._create_account_page_type not in {"about_you", ""}:
+                if self._create_account_page_type and self._create_account_page_type not in {""}:
                     return True
 
                 return False
@@ -3378,7 +3421,7 @@ class RegistrationEngine:
             or "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\""
         ).strip()
 
-        max_attempts = 2
+        max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
                 sentinel_token = build_sentinel_token(
@@ -3404,7 +3447,7 @@ class RegistrationEngine:
                     OPENAI_API_ENDPOINTS["create_account"],
                     headers=request_headers,
                     json=user_info,
-                    timeout=45,
+                    timeout=30,
                 )
 
                 self._log(f"账户创建状态: {response.status_code}")
@@ -3418,7 +3461,13 @@ class RegistrationEngine:
                     response_text = str(response.text or "")[:200]
                 except Exception:
                     response_text = ""
-                self._log(f"账户创建失败: {response_text}", "warning")
+
+                if response.status_code == 400 and "user_already_exists" in response_text:
+                    self._log("create_account 返回 user_already_exists，账户已在前次超时请求中创建，按成功继续", "warning")
+                    _cache_create_account_response(response, "create_account(already_exists)")
+                    return True
+
+                self._log(f"账户创建失败 (HTTP {response.status_code}): {response_text}", "warning")
 
                 if _probe_create_account_progress():
                     self._log("create_account 接口虽然未正常返回，但状态已经推进，按创建成功继续", "warning")
@@ -3426,15 +3475,16 @@ class RegistrationEngine:
 
                 if response.status_code in {409, 429, 500, 502, 503, 504} and attempt < max_attempts:
                     self._log(
-                        f"create_account 第 {attempt}/{max_attempts} 次返回 HTTP {response.status_code}，重试同一请求...",
+                        f"create_account 第 {attempt}/{max_attempts} 次返回 HTTP {response.status_code}，重建连接后重试...",
                         "warning",
                     )
+                    self._rebuild_session()
                     time.sleep(2)
                     continue
                 return False
 
             except Exception as e:
-                self._log(f"创建账户失败: {e}", "error")
+                self._log(f"[create_account] 第 {attempt}/{max_attempts} 次请求异常: {e}", "error")
 
                 if _probe_create_account_progress():
                     self._log("create_account 请求异常后状态已推进，按创建成功继续", "warning")
@@ -3442,9 +3492,10 @@ class RegistrationEngine:
 
                 if _is_transient_network_error(e) and attempt < max_attempts:
                     self._log(
-                        f"create_account 第 {attempt}/{max_attempts} 次遇到网络异常，重试同一请求...",
+                        f"create_account 第 {attempt}/{max_attempts} 次网络异常（连接池可能卡死），重建会话后重试...",
                         "warning",
                     )
+                    self._rebuild_session()
                     time.sleep(2)
                     continue
                 return False
