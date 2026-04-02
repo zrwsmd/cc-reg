@@ -2672,12 +2672,18 @@ class RegistrationEngine:
     def _probe_otp_validation_progress(self) -> Tuple[bool, str]:
         probe_url = "https://auth.openai.com/email-verification"
         try:
+            probe_headers = {
+                "referer": "https://auth.openai.com/email-verification",
+                "origin": "https://auth.openai.com",
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "sec-fetch-site": "same-origin",
+            }
+            did = str(self.device_id or "").strip()
+            if did:
+                probe_headers["oai-device-id"] = did
             probe_response = self.session.get(
                 probe_url,
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                },
+                headers=probe_headers,
                 allow_redirects=True,
                 timeout=15,
             )
@@ -2725,17 +2731,24 @@ class RegistrationEngine:
             self._last_otp_validation_status_code = None
             self._last_otp_validation_outcome = ""
             self._last_otp_validation_reason = ""
-            code_body = f'{{"code":"{code}"}}'
+
+            request_headers = {
+                "referer": "https://auth.openai.com/email-verification",
+                "origin": "https://auth.openai.com",
+                "accept": "application/json",
+                "content-type": "application/json",
+                "sec-fetch-site": "same-origin",
+            }
+            did = str(self.device_id or "").strip()
+            if did:
+                request_headers["oai-device-id"] = did
+            request_headers.update(generate_datadog_trace())
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["validate_otp"],
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
-                data=code_body,
-                timeout=60,
+                headers=request_headers,
+                json={"code": code},
+                timeout=30,
             )
 
             self._log(f"验证码校验状态: {response.status_code}")
