@@ -2360,6 +2360,7 @@ class RegistrationEngine:
                     "referer": send_referer,
                     "accept": "application/json",
                 },
+                timeout=45,
             )
 
             self._log(f"验证码发送状态: {response.status_code}")
@@ -2413,6 +2414,7 @@ class RegistrationEngine:
                     "content-type": "application/json",
                 },
                 data=code_body,
+                timeout=60,
             )
 
             self._log(f"验证码校验状态: {response.status_code}")
@@ -2679,6 +2681,7 @@ class RegistrationEngine:
                     "content-type": "application/json",
                 },
                 data=create_account_body,
+                timeout=45,
             )
 
             self._log(f"账户创建状态: {response.status_code}")
