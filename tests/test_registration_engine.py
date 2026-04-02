@@ -335,6 +335,47 @@ def test_verify_email_otp_retries_same_code_after_network_timeout():
     assert validated_codes == ["112233", "112233"]
 
 
+def test_verify_email_otp_reuses_last_code_across_attempts_after_network_timeout():
+    email_service = FakeEmailService(["445566"])
+    engine = RegistrationEngine(email_service)
+
+    fetched_codes = []
+    validated_codes = []
+
+    def fake_get_verification_code(timeout=None):
+        fetched_codes.append(timeout)
+        if len(fetched_codes) > 1:
+            raise AssertionError("should reuse the previous OTP instead of waiting for a new email")
+        return "445566"
+
+    def fake_validate_verification_code(code):
+        validated_codes.append(code)
+        engine._last_otp_validation_code = code
+        engine._last_otp_validation_status_code = None
+        if len(validated_codes) < 3:
+            engine._last_otp_validation_outcome = "network_timeout"
+            engine._last_otp_validation_reason = "状态探测也超时，暂时无法判断服务端是否已处理验证码"
+            return False
+        engine._last_otp_validation_outcome = "success"
+        engine._last_otp_validation_reason = "服务端已接受验证码"
+        return True
+
+    original_sleep = register_module.time.sleep
+    engine._get_verification_code = fake_get_verification_code
+    engine._validate_verification_code = fake_validate_verification_code
+    register_module.time.sleep = lambda _seconds: None
+
+    try:
+        result = engine._verify_email_otp_with_retry(stage_label="注册验证码", max_attempts=3)
+    finally:
+        register_module.time.sleep = original_sleep
+
+    assert result is True
+    assert fetched_codes == [None]
+    assert validated_codes == ["445566", "445566", "445566"]
+    assert any("继续复用上一枚验证码 445566" in log for log in engine.logs)
+
+
 def test_validate_verification_code_reports_probe_reason_after_timeout():
     email_service = FakeEmailService([])
     engine = RegistrationEngine(email_service)
@@ -571,3 +612,23 @@ def test_register_password_retries_same_payload_after_timeout_without_progress()
     post_calls = [call for call in session.calls if call["method"] == "POST"]
     assert len(post_calls) == 2
     assert post_calls[0]["kwargs"]["json"] == post_calls[1]["kwargs"]["json"]
+
+
+def test_send_verification_code_treats_timeout_as_assumed_sent():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    timeout_error = Exception(
+        "Failed to perform, curl: (28) Operation timed out after 45015 milliseconds with 0 bytes received."
+    )
+    session = QueueSession([
+        ("GET", OPENAI_API_ENDPOINTS["send_otp"], lambda _session: (_ for _ in ()).throw(timeout_error)),
+    ])
+    engine.session = session
+
+    result = engine._send_verification_code()
+
+    assert result is True
+    assert engine._last_send_otp_outcome == "timeout_assumed_sent"
+    assert any("继续等待邮箱" in log for log in engine.logs)
+    assert all("curl: (28)" not in log for log in engine.logs)

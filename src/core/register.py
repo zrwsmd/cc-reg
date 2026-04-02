@@ -163,6 +163,8 @@ class RegistrationEngine:
         self._last_otp_validation_status_code: Optional[int] = None
         self._last_otp_validation_outcome: str = ""  # success/http_non_200/network_timeout/network_error
         self._last_otp_validation_reason: str = ""
+        self._last_send_otp_outcome: str = ""
+        self._last_send_otp_reason: str = ""
         self._oai_session_id: str = str(uuid.uuid4())
         self._oai_client_version: str = _DEFAULT_OAI_CLIENT_VERSION
         self._oai_client_build: str = _DEFAULT_OAI_CLIENT_BUILD
@@ -2924,6 +2926,132 @@ class RegistrationEngine:
 
         return False
 
+    def _verify_email_otp_with_retry(
+        self,
+        stage_label: str = "验证码",
+        max_attempts: int = 3,
+        fetch_timeout: Optional[int] = None,
+        attempted_codes: Optional[set[str]] = None,
+    ) -> bool:
+        """Retry OTP validation, reusing the same OTP across attempts after network timeouts."""
+        self._last_validate_otp_continue_url = None
+        self._last_validate_otp_workspace_id = None
+        if attempted_codes is None:
+            attempted_codes = set()
+
+        def _is_login_stage() -> bool:
+            if not stage_label:
+                return False
+            stage_label_lower = stage_label.lower()
+            return (
+                "登录验证码" in stage_label
+                or "login" in stage_label_lower
+                or "会话桥接" in stage_label
+            )
+
+        def _current_reason() -> str:
+            return str(self._last_otp_validation_reason or self._last_otp_validation_outcome or "未知原因").strip()
+
+        def _validate_same_code_with_network_retry(code: str, attempt: int) -> bool:
+            same_code_attempt = 0
+            max_same_code_attempts = 2
+
+            while same_code_attempt < max_same_code_attempts:
+                same_code_attempt += 1
+                if self._validate_verification_code(code):
+                    if _is_login_stage():
+                        self._touch_otp_continue_url(stage_label)
+                    return True
+
+                if self._last_otp_validation_outcome not in {"network_timeout", "network_error"}:
+                    return False
+
+                if same_code_attempt >= max_same_code_attempts:
+                    return False
+
+                self._log(
+                    f"{stage_label}第 {attempt}/{max_attempts} 次校验遇到网络异常，{_current_reason()}，直接重试同一码 {code}...",
+                    "warning",
+                )
+                time.sleep(2)
+
+            return False
+
+        last_code: Optional[str] = None
+
+        for attempt in range(1, max_attempts + 1):
+            reuse_last_code = bool(
+                last_code
+                and self._last_otp_validation_code == last_code
+                and self._last_otp_validation_outcome in {"network_timeout", "network_error"}
+            )
+
+            if reuse_last_code:
+                code = last_code
+                self._log(
+                    f"{stage_label}第 {attempt}/{max_attempts} 次继续复用上一枚验证码 {code}，避免空等新邮件...",
+                    "warning",
+                )
+            else:
+                code = (
+                    self._get_verification_code(timeout=fetch_timeout)
+                    if fetch_timeout
+                    else self._get_verification_code()
+                )
+
+            if not code and last_code and self._last_otp_validation_outcome in {"network_timeout", "network_error"}:
+                code = last_code
+                self._log(
+                    f"{stage_label}第 {attempt}/{max_attempts} 次未取到新验证码，但上一枚验证码 {code} 仍待确认，继续复用...",
+                    "warning",
+                )
+
+            if not code:
+                if attempt < max_attempts:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次未取到验证码，稍后重试...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+            last_code = code
+            allow_duplicate_retry = (
+                code in attempted_codes
+                and self._last_otp_validation_code == code
+                and self._last_otp_validation_outcome in {"network_timeout", "network_error"}
+            )
+            if code in attempted_codes and not allow_duplicate_retry:
+                if attempt < max_attempts:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次命中重复验证码 {code}，等待新邮件...",
+                        "warning",
+                    )
+                    time.sleep(2)
+                    continue
+                return False
+
+            attempted_codes.add(code)
+
+            if _validate_same_code_with_network_retry(code, attempt):
+                return True
+
+            if attempt < max_attempts:
+                if self._last_otp_validation_outcome in {"network_timeout", "network_error"}:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次同一码重试后仍未推进，原因：{_current_reason()}，下一轮继续优先复用同一码...",
+                        "warning",
+                    )
+                else:
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次校验未通过，疑似旧验证码，自动重试下一封...",
+                        "warning",
+                    )
+                time.sleep(2)
+
+        return False
+
     def _create_user_account(self) -> bool:
         """创建用户账户"""
         try:
@@ -3309,6 +3437,100 @@ class RegistrationEngine:
                 return False
 
         return False
+
+    def _send_verification_code(self, referer: Optional[str] = None) -> bool:
+        """鍙戦€侀獙璇佺爜銆愬悗缃鐩栫増锛氬皢 send_otp 瓒呮椂瑙嗕负鍋囧け璐ワ級"""
+        self._last_send_otp_outcome = ""
+        self._last_send_otp_reason = ""
+        try:
+            self._otp_sent_at = time.time()
+            send_referer = str(referer or "https://auth.openai.com/create-account/password").strip()
+
+            response = self.session.get(
+                OPENAI_API_ENDPOINTS["send_otp"],
+                headers={
+                    "referer": send_referer,
+                    "accept": "application/json",
+                },
+                timeout=45,
+            )
+
+            self._log(f"楠岃瘉鐮佸彂閫佺姸鎬? {response.status_code}")
+            self._log(f"楠岃瘉鐮佸彂閫佷俊鎭? {response.text}")
+
+            if response.status_code == 200:
+                self._last_send_otp_outcome = "success"
+                self._last_send_otp_reason = "楠岃瘉鐮佸彂閫佹帴鍙ｅ凡杩斿洖 HTTP 200"
+                return True
+
+            self._last_send_otp_outcome = "http_non_200"
+            self._last_send_otp_reason = f"楠岃瘉鐮佸彂閫佹帴鍙ｈ繑鍥? HTTP {response.status_code}"
+            return False
+
+        except Exception as e:
+            err_text = str(e or "").lower()
+            if (
+                "timed out" in err_text
+                or "timeout" in err_text
+                or "curl: (28)" in err_text
+                or "operation timed out" in err_text
+            ):
+                self._last_send_otp_outcome = "timeout_assumed_sent"
+                self._last_send_otp_reason = "鍙戦€侀獙璇佺爜鎺ュ彛瓒呮椂锛屼絾楠岃瘉鐮佸ぇ姒傚凡缁忓彂鍑猴紝缁х画绛夊緟閭"
+                self._log(self._last_send_otp_reason, "warning")
+                return True
+
+            self._last_send_otp_outcome = "network_error"
+            self._last_send_otp_reason = str(e)
+            self._log(f"鍙戦€侀獙璇佺爜澶辫触: {e}", "error")
+            return False
+
+    def _send_verification_code(self, referer: Optional[str] = None) -> bool:
+        """Send the signup OTP, treating send_otp timeouts as assumed success."""
+        self._last_send_otp_outcome = ""
+        self._last_send_otp_reason = ""
+        try:
+            self._otp_sent_at = time.time()
+            send_referer = str(referer or "https://auth.openai.com/create-account/password").strip()
+
+            response = self.session.get(
+                OPENAI_API_ENDPOINTS["send_otp"],
+                headers={
+                    "referer": send_referer,
+                    "accept": "application/json",
+                },
+                timeout=45,
+            )
+
+            self._log(f"验证码发送状态: {response.status_code}")
+            self._log(f"验证码发送信息: {response.text}")
+
+            if response.status_code == 200:
+                self._last_send_otp_outcome = "success"
+                self._last_send_otp_reason = "send_otp returned HTTP 200"
+                return True
+
+            self._last_send_otp_outcome = "http_non_200"
+            self._last_send_otp_reason = f"send_otp returned HTTP {response.status_code}"
+            return False
+
+        except Exception as e:
+            err_text = str(e or "").lower()
+            if (
+                "timed out" in err_text
+                or "timeout" in err_text
+                or "curl: (28)" in err_text
+                or "operation timed out" in err_text
+            ):
+                self._last_send_otp_outcome = "timeout_assumed_sent"
+                self._last_send_otp_reason = "send_otp timeout, assume OTP already sent"
+                self._log("发送验证码接口超时，但验证码大概率已经发出，继续等待邮箱", "warning")
+                return True
+
+            self._last_send_otp_outcome = "network_error"
+            self._last_send_otp_reason = str(e)
+            self._log(f"发送验证码失败: {e}", "error")
+            return False
 
     def _decode_jwt_payload(self, token: str) -> Dict[str, Any]:
         """解析 JWT payload（不验证签名）。"""
