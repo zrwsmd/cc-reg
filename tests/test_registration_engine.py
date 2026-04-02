@@ -297,6 +297,40 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert result.metadata["token_acquired_via_relogin"] is False
 
 
+def test_existing_account_add_phone_is_saved_as_partial_success():
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "existing@example.com"
+    engine.password = "secret-1"
+    engine.device_id = "device-existing"
+
+    engine._create_email = lambda: True
+    engine._prepare_authorize_flow = lambda _label: ("device-existing", "sentinel-existing")
+    engine._submit_signup_form = lambda _did, _sen: register_module.SignupFormResult(
+        success=True,
+        is_existing_account=True,
+        page_type=OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
+    )
+
+    def fake_complete(result):
+        result.error_message = "命中 add-phone 风控页，需要手机号验证，当前无法继续获取 token"
+        return False
+
+    engine._complete_token_exchange_native_backup = fake_complete
+
+    result = engine._run_native_registration()
+
+    assert result.success is True
+    assert result.email == "existing@example.com"
+    assert result.password == "secret-1"
+    assert result.device_id == "device-existing"
+    assert result.error_message == "add-phone 风控：账号已创建，token 待后续获取"
+    assert result.metadata["add_phone_blocked"] is True
+    assert result.metadata["phone_verification_required"] is True
+    assert result.metadata["token_pending"] is True
+    assert result.metadata["token_acquired_via_relogin"] is False
+
+
 def test_verify_email_otp_retries_same_code_after_network_timeout():
     email_service = FakeEmailService(["112233"])
     engine = RegistrationEngine(email_service)

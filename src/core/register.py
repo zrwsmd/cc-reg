@@ -4067,6 +4067,30 @@ class RegistrationEngine:
             meta.update(extra)
         return meta
 
+    def _mark_add_phone_partial_success(self, result: RegistrationResult) -> bool:
+        """When OpenAI requires phone verification, keep the created account instead of hard-failing."""
+        err_msg = str(result.error_message or "").lower()
+        if ("add-phone" not in err_msg) and ("add_phone" not in err_msg):
+            return False
+
+        self._log(
+            "命中 add-phone 风控页，但账号已创建或邮箱/密码已可用，按部分成功保存，等待后续补手机号获取 token",
+            "warning",
+        )
+        result.success = True
+        result.email = self.email or result.email
+        result.password = self.password or result.password
+        result.device_id = result.device_id or str(self.device_id or "")
+        result.error_message = "add-phone 风控：账号已创建，token 待后续获取"
+        result.metadata = self._build_result_metadata(
+            registration_flow="native",
+            token_acquired_via_relogin=False,
+            add_phone_blocked=True,
+            phone_verification_required=True,
+            token_pending=True,
+        )
+        return True
+
     def _run_native_registration(self) -> RegistrationResult:
         """
         Run the original native registration flow.
@@ -4107,6 +4131,7 @@ class RegistrationEngine:
                     else self._complete_token_exchange_native_backup(result)
                 )
                 if not complete_ok:
+                    self._mark_add_phone_partial_success(result)
                     return result
 
                 result.success = True
@@ -4184,19 +4209,7 @@ class RegistrationEngine:
                 else self._complete_token_exchange_native_backup(result)
             )
             if not complete_ok:
-                err_msg = str(result.error_message or "").lower()
-                if "add-phone" in err_msg or "add_phone" in err_msg:
-                    self._log("重登录命中 add-phone 风控页，但账号已注册成功（邮箱+密码有效），按部分成功保存", "warning")
-                    result.success = True
-                    result.email = self.email or result.email
-                    result.password = self.password or result.password
-                    result.device_id = result.device_id or str(self.device_id or "")
-                    result.error_message = "add-phone 风控：账号已创建，token 待后续获取"
-                    result.metadata = self._build_result_metadata(
-                        registration_flow="native",
-                        token_acquired_via_relogin=False,
-                        add_phone_blocked=True,
-                    )
+                self._mark_add_phone_partial_success(result)
                 return result
 
             result.success = True
