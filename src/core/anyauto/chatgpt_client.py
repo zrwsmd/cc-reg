@@ -643,6 +643,15 @@ class ChatGPTClient:
         self._log(f"注册用户: {email}")
         url = f"{self.AUTH}/api/accounts/user/register"
         
+        sentinel_token = build_sentinel_token(
+            self.session,
+            self.device_id,
+            flow="register",
+            user_agent=self.ua,
+            sec_ch_ua=self.sec_ch_ua,
+            impersonate=self.impersonate,
+        )
+
         headers = self._headers(
             url,
             accept="application/json",
@@ -654,6 +663,8 @@ class ChatGPTClient:
                 "oai-device-id": self.device_id,
             },
         )
+        if sentinel_token:
+            headers["openai-sentinel-token"] = sentinel_token
         headers.update(generate_datadog_trace())
         
         payload = {

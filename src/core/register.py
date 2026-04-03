@@ -2333,6 +2333,8 @@ class RegistrationEngine:
         }
         if did or self.device_id:
             request_headers["oai-device-id"] = str(did or self.device_id)
+        if sen_token:
+            request_headers["openai-sentinel-token"] = sen_token
         request_headers.update(generate_datadog_trace())
 
         max_attempts = 2
