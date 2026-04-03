@@ -186,6 +186,27 @@ class ChatGPTClient:
         })
         seed_oai_device_cookie(self.session, self.device_id)
 
+    def _purge_stale_auth_cookies(self):
+        """清除可能导致跨账号关联的 auth.openai.com 域旧 cookie。
+        
+        关键目标：oai-client-auth-info — 该 cookie 会携带上一次登录的邮箱
+        （Max-Age 30 天），让 OpenAI 判定同一会话切换账号，触发 add-phone。
+        """
+        stale_names = {"oai-client-auth-info"}
+        removed = 0
+        try:
+            to_remove = [c for c in self.session.cookies.jar if c.name in stale_names]
+            for c in to_remove:
+                try:
+                    self.session.cookies.jar.clear(c.domain, c.path, c.name)
+                    removed += 1
+                except Exception:
+                    pass
+            if removed:
+                self._log(f"已清除 {removed} 个跨账号关联 cookie（oai-client-auth-info）")
+        except Exception as e:
+            self._log(f"清除旧 auth cookie 异常: {e}")
+
     def _state_from_url(self, url, method="GET"):
         state = extract_flow_state(
             current_url=normalize_flow_url(url, auth_base=self.AUTH),
@@ -901,6 +922,9 @@ class ChatGPTClient:
 
             break
         
+        # 清除可能导致跨账号关联的旧 cookie（authorize 步骤可能被服务端写入旧登录痕迹）
+        self._purge_stale_auth_cookies()
+
         state = self._state_from_url(final_url)
         self._log(f"注册状态起点: {describe_flow_state(state)}")
 
@@ -924,6 +948,8 @@ class ChatGPTClient:
                 self._log("全新注册流程")
                 if register_submitted:
                     return False, "注册密码阶段重复进入"
+                # 注册前再次清理 cookie，防止 signup 响应写入的旧登录痕迹
+                self._purge_stale_auth_cookies()
                 success = False
                 msg = ""
                 for register_attempt in range(3):
@@ -989,6 +1015,8 @@ class ChatGPTClient:
             if self._state_is_about_you(state):
                 if account_created:
                     return False, "填写信息阶段重复进入"
+                # create_account 前清理 cookie，防止旧登录痕迹触发 add-phone
+                self._purge_stale_auth_cookies()
                 success, next_state = self.create_account(
                     first_name,
                     last_name,

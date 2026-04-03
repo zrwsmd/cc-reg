@@ -32,6 +32,7 @@ from ..config.constants import (
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
     PASSWORD_CHARSET,
+    PASSWORD_SPECIAL_CHARS,
     AccountStatus,
     TaskStatus,
 )
@@ -361,8 +362,51 @@ class RegistrationEngine:
         return ""
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
-        """生成随机密码"""
-        return ''.join(secrets.choice(PASSWORD_CHARSET) for _ in range(length))
+        """生成随机密码（包含大小写字母、数字和特殊字符）"""
+        full_charset = PASSWORD_CHARSET + PASSWORD_SPECIAL_CHARS
+        # 确保至少包含各类字符
+        password = [
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.digits),
+            secrets.choice(PASSWORD_SPECIAL_CHARS),
+        ]
+        password.extend(secrets.choice(full_charset) for _ in range(max(0, length - 4)))
+        secrets.SystemRandom().shuffle(password)
+        return ''.join(password)
+
+    def _purge_stale_auth_cookies(self) -> None:
+        """
+        清除 auth.openai.com 域下可能导致跨账号关联的旧 cookie。
+        关键目标：oai-client-auth-info — 该 cookie 会携带上一次注册/登录的邮箱信息
+        （Max-Age 30 天），导致 OpenAI 判定同一浏览器切换账号注册，触发 add-phone 风控。
+        """
+        stale_names = {"oai-client-auth-info"}
+        if not self.session:
+            return
+        removed = 0
+        try:
+            jar = getattr(self.session.cookies, "jar", None)
+            if jar is not None:
+                to_remove = [c for c in jar if c.name in stale_names]
+                for c in to_remove:
+                    try:
+                        jar.clear(c.domain, c.path, c.name)
+                        removed += 1
+                    except Exception:
+                        pass
+            else:
+                # fallback: 覆盖为空值使其失效
+                for name in stale_names:
+                    try:
+                        self.session.cookies.set(name, "", domain="auth.openai.com", path="/")
+                        removed += 1
+                    except Exception:
+                        pass
+            if removed:
+                self._log(f"已清除 {removed} 个跨账号关联 cookie（oai-client-auth-info 等）")
+        except Exception as e:
+            self._log(f"清除旧 auth cookie 异常: {e}", "warning")
 
     def _check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """检查 IP 地理位置"""
@@ -4116,6 +4160,9 @@ class RegistrationEngine:
                 result.error_message = "Sentinel POW 验证失败"
                 return result
 
+            # 清除可能导致跨账号关联的旧 cookie（如 oai-client-auth-info）
+            self._purge_stale_auth_cookies()
+
             signup_result = self._submit_signup_form(did, sen_token)
             if not signup_result.success:
                 result.error_message = signup_result.error_message or "提交注册表单失败"
@@ -4143,6 +4190,9 @@ class RegistrationEngine:
                     token_acquired_via_relogin=False,
                 )
                 return result
+
+            # 注册密码前再次清理，防止 signup 响应写入的旧 cookie 影响后续请求
+            self._purge_stale_auth_cookies()
 
             password_ok, _password = self._register_password(did, sen_token)
             if not password_ok:
