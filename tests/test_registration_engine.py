@@ -6,6 +6,7 @@ from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
 from src.core.register import RegistrationEngine
+from src.core.utils import generate_password
 from src.services.base import BaseEmailService
 
 
@@ -295,6 +296,22 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_generated_passwords_use_letters_digits_and_underscore_only():
+    engine = RegistrationEngine(FakeEmailService([]))
+
+    generated = {
+        engine._generate_password(16),
+        generate_password(16),
+    }
+
+    for password in generated:
+        assert len(password) == 16
+        assert all(ch.isalnum() or ch == "_" for ch in password)
+        assert any(ch.islower() for ch in password)
+        assert any(ch.isupper() for ch in password)
+        assert any(ch.isdigit() for ch in password)
 
 
 def test_existing_account_add_phone_is_saved_as_partial_success():

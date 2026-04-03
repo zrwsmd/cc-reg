@@ -32,7 +32,6 @@ from ..config.constants import (
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
     PASSWORD_CHARSET,
-    PASSWORD_SPECIAL_CHARS,
     AccountStatus,
     TaskStatus,
 )
@@ -362,16 +361,15 @@ class RegistrationEngine:
         return ""
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
-        """生成随机密码（包含大小写字母、数字和特殊字符）"""
-        full_charset = PASSWORD_CHARSET + PASSWORD_SPECIAL_CHARS
-        # 确保至少包含各类字符
+        """生成随机密码（仅包含字母、数字和下划线）"""
+        full_charset = PASSWORD_CHARSET
+        # 确保至少包含大小写字母和数字
         password = [
             secrets.choice(string.ascii_lowercase),
             secrets.choice(string.ascii_uppercase),
             secrets.choice(string.digits),
-            secrets.choice(PASSWORD_SPECIAL_CHARS),
         ]
-        password.extend(secrets.choice(full_charset) for _ in range(max(0, length - 4)))
+        password.extend(secrets.choice(full_charset) for _ in range(max(0, length - len(password))))
         secrets.SystemRandom().shuffle(password)
         return ''.join(password)
 
@@ -2331,10 +2329,30 @@ class RegistrationEngine:
             "content-type": "application/json",
             "sec-fetch-site": "same-origin",
         }
-        if did or self.device_id:
-            request_headers["oai-device-id"] = str(did or self.device_id)
-        if sen_token:
-            request_headers["openai-sentinel-token"] = sen_token
+        device_id_str = str(did or self.device_id or "")
+        if device_id_str:
+            request_headers["oai-device-id"] = device_id_str
+
+        # Password submission requires a fresh token with flow="register"
+        session_headers = getattr(self.session, "headers", {}) or {}
+        user_agent = str(session_headers.get("User-Agent") or session_headers.get("user-agent") or "").strip()
+        sec_ch_ua = str(session_headers.get("sec-ch-ua") or session_headers.get("Sec-CH-UA") or "").strip()
+        
+        try:
+            from .anyauto.sentinel_token import build_sentinel_token
+            fresh_sen_token = build_sentinel_token(
+                self.session,
+                device_id_str,
+                flow="register",
+                user_agent=user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                sec_ch_ua=sec_ch_ua or '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            )
+            if fresh_sen_token:
+                request_headers["openai-sentinel-token"] = fresh_sen_token
+            else:
+                self._log("生成注册 Sentinel Token 失败，将不带此 header 重试", "warning")
+        except Exception as e:
+            self._log(f"构建注册 Sentinel Token 异常: {e}", "error")
         request_headers.update(generate_datadog_trace())
 
         max_attempts = 2

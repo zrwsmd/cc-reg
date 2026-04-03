@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union, Callable
 from pathlib import Path
 
-from ..config.constants import PASSWORD_CHARSET, PASSWORD_SPECIAL_CHARS, DEFAULT_PASSWORD_LENGTH
+from ..config.constants import PASSWORD_CHARSET, DEFAULT_PASSWORD_LENGTH
 from ..config.settings import get_settings
 from .timezone_utils import SHANGHAI_TZ
 
@@ -97,21 +97,20 @@ def generate_password(length: int = DEFAULT_PASSWORD_LENGTH) -> str:
     Returns:
         随机密码字符串
     """
-    if length < 4:
-        length = 4
+    if length < 3:
+        length = 3
 
-    full_charset = PASSWORD_CHARSET + PASSWORD_SPECIAL_CHARS
+    full_charset = PASSWORD_CHARSET
 
-    # 确保密码包含至少一个大写字母、一个小写字母、一个数字和一个特殊字符
+    # 确保密码包含至少一个大写字母、一个小写字母和一个数字
     password = [
         secrets.choice(string.ascii_lowercase),
         secrets.choice(string.ascii_uppercase),
         secrets.choice(string.digits),
-        secrets.choice(PASSWORD_SPECIAL_CHARS),
     ]
 
     # 添加剩余字符
-    password.extend(secrets.choice(full_charset) for _ in range(length - 4))
+    password.extend(secrets.choice(full_charset) for _ in range(length - len(password)))
 
     # 随机打乱
     secrets.SystemRandom().shuffle(password)
