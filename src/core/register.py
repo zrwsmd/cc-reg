@@ -2331,6 +2331,8 @@ class RegistrationEngine:
             "content-type": "application/json",
             "sec-fetch-site": "same-origin",
         }
+        if did or self.device_id:
+            request_headers["oai-device-id"] = str(did or self.device_id)
         request_headers.update(generate_datadog_trace())
 
         max_attempts = 2

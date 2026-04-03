@@ -650,6 +650,9 @@ class ChatGPTClient:
             origin=self.AUTH,
             content_type="application/json",
             fetch_site="same-origin",
+            extra_headers={
+                "oai-device-id": self.device_id,
+            },
         )
         headers.update(generate_datadog_trace())
         
