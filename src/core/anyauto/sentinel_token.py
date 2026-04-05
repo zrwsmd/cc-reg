@@ -187,6 +187,9 @@ def build_sentinel_token(session, device_id, flow="authorize_continue", user_age
         return None
 
     pow_data = challenge.get("proofofwork") or {}
+    turnstile_data = challenge.get("turnstile") or {}
+    t_value = turnstile_data.get("dx", "") if isinstance(turnstile_data, dict) else ""
+
     generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
 
     if pow_data.get("required") and pow_data.get("seed"):
@@ -199,7 +202,7 @@ def build_sentinel_token(session, device_id, flow="authorize_continue", user_age
 
     return json.dumps({
         "p": p_value,
-        "t": "",
+        "t": t_value,
         "c": c_value,
         "id": device_id,
         "flow": flow,
