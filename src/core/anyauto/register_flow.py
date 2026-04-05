@@ -13,7 +13,7 @@ from typing import Optional, Callable, Dict, Any
 from .chatgpt_client import ChatGPTClient
 from .oauth_client import OAuthClient
 from .utils import generate_random_name, generate_random_birthday, decode_jwt_payload
-from ...config.constants import PASSWORD_CHARSET, DEFAULT_PASSWORD_LENGTH
+from ...config.constants import PASSWORD_CHARSET, PASSWORD_SPECIAL_CHARS, PASSWORD_FULL_CHARSET, DEFAULT_PASSWORD_LENGTH
 from ...config.settings import get_settings
 
 
@@ -83,7 +83,17 @@ class AnyAutoRegistrationEngine:
     @staticmethod
     def _build_password(length: int) -> str:
         length = max(8, int(length or DEFAULT_PASSWORD_LENGTH))
-        return "".join(secrets.choice(PASSWORD_CHARSET) for _ in range(length))
+        # 确保密码包含大小写字母、数字和特殊字符，满足 OpenAI 密码策略
+        import string
+        password = [
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.digits),
+            secrets.choice(PASSWORD_SPECIAL_CHARS),
+        ]
+        password.extend(secrets.choice(PASSWORD_FULL_CHARSET) for _ in range(max(0, length - len(password))))
+        secrets.SystemRandom().shuffle(password)
+        return "".join(password)
 
     @staticmethod
     def _should_retry(message: str) -> bool:

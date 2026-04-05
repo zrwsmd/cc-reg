@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 OAuth 客户端模块 - 处理 Codex OAuth 登录流程
 """

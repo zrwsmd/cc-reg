@@ -688,9 +688,21 @@ class ChatGPTClient:
                 try:
                     error_data = r.json()
                     error_msg = error_data.get("error", {}).get("message", r.text[:200])
+                    error_code = error_data.get("error", {}).get("code", "")
                 except:
                     error_msg = r.text[:200]
+                    error_code = ""
                 self._log(f"注册失败: {r.status_code} - {error_msg}")
+                # 输出诊断信息，帮助排查风控原因
+                cf_ray = r.headers.get("cf-ray", "")
+                server = r.headers.get("server", "")
+                if cf_ray:
+                    self._log(f"[诊断] CF-Ray: {cf_ray}, Server: {server}")
+                if "failed to create" in str(error_msg).lower():
+                    self._log(f"[诊断] 邮箱: {email}, 密码长度: {len(password)}, 含特殊字符: {any(c in password for c in '!@#$%&*')}")
+                    email_domain = email.split("@")[-1] if "@" in email else ""
+                    if email_domain:
+                        self._log(f"[诊断] 邮箱域名: {email_domain} — 若为临时/自建域名可能被 OpenAI 风控拦截，建议更换主流邮箱域名重试")
                 return False, f"HTTP {r.status_code}: {error_msg}"
                 
         except Exception as e:
@@ -970,9 +982,14 @@ class ChatGPTClient:
                     success, msg = self.register_user(email, password)
                     if success:
                         break
-                    if self._last_register_outcome in {"network_timeout", "network_error"} and register_attempt < 2:
-                        self._log(f"注册提交遇到网络异常，重试同一请求 {register_attempt + 2}/3 ...")
-                        time.sleep(2)
+                    is_network_err = self._last_register_outcome in {"network_timeout", "network_error"}
+                    is_transient_400 = (
+                        self._last_register_status_code == 400
+                        and "failed to create" in str(msg or "").lower()
+                    )
+                    if (is_network_err or is_transient_400) and register_attempt < 2:
+                        self._log(f"注册提交失败（{'网络异常' if is_network_err else '服务端拒绝'}），重试 {register_attempt + 2}/3 ...")
+                        time.sleep(3 if is_transient_400 else 2)
                         continue
                     return False, f"注册失败: {msg}"
                 register_submitted = True

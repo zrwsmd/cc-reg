@@ -32,6 +32,8 @@ from ..config.constants import (
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
     PASSWORD_CHARSET,
+    PASSWORD_SPECIAL_CHARS,
+    PASSWORD_FULL_CHARSET,
     AccountStatus,
     TaskStatus,
 )
@@ -361,15 +363,15 @@ class RegistrationEngine:
         return ""
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
-        """生成随机密码（仅包含字母、数字和下划线）"""
-        full_charset = PASSWORD_CHARSET
-        # 确保至少包含大小写字母和数字
+        """生成随机密码（包含大小写字母、数字和特殊字符）"""
+        # 确保至少包含大小写字母、数字和特殊字符
         password = [
             secrets.choice(string.ascii_lowercase),
             secrets.choice(string.ascii_uppercase),
             secrets.choice(string.digits),
+            secrets.choice(PASSWORD_SPECIAL_CHARS),
         ]
-        password.extend(secrets.choice(full_charset) for _ in range(max(0, length - len(password))))
+        password.extend(secrets.choice(PASSWORD_FULL_CHARSET) for _ in range(max(0, length - len(password))))
         secrets.SystemRandom().shuffle(password)
         return ''.join(password)
 
@@ -2355,7 +2357,7 @@ class RegistrationEngine:
             self._log(f"构建注册 Sentinel Token 异常: {e}", "error")
         request_headers.update(generate_datadog_trace())
 
-        max_attempts = 2
+        max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self.session.post(
@@ -2409,12 +2411,27 @@ class RegistrationEngine:
                 except Exception:
                     self._last_register_password_error = f"注册密码接口返回异常: HTTP {response.status_code}"
 
-                if response.status_code in {409, 429, 500, 502, 503, 504} and attempt < max_attempts:
+                is_transient_400 = (
+                    response.status_code == 400
+                    and "failed to create" in str(error_text or "").lower()
+                )
+                if is_transient_400:
+                    email_domain = self.email.split("@")[-1] if "@" in (self.email or "") else ""
+                    self._log(
+                        f"[诊断] 邮箱: {self.email}, 密码长度: {len(password)}, 含特殊字符: {any(c in password for c in '!@#$%&*')}",
+                        "warning",
+                    )
+                    if email_domain:
+                        self._log(
+                            f"[诊断] 邮箱域名: {email_domain} — 若为临时/自建域名可能被 OpenAI 风控拦截，建议更换主流邮箱域名重试",
+                            "warning",
+                        )
+                if (response.status_code in {409, 429, 500, 502, 503, 504} or is_transient_400) and attempt < max_attempts:
                     self._log(
                         f"密码注册第 {attempt}/{max_attempts} 次返回 HTTP {response.status_code}，重试同一请求...",
                         "warning",
                     )
-                    time.sleep(2)
+                    time.sleep(3 if is_transient_400 else 2)
                     continue
                 return False, None
 
