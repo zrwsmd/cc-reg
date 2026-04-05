@@ -168,7 +168,20 @@ def fetch_sentinel_challenge(session, device_id, flow="authorize_continue", user
     try:
         resp = session.post("https://sentinel.openai.com/backend-api/sentinel/req", **kwargs)
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            # ===== 诊断日志：sentinel 响应完整结构 =====
+            import logging as _logging
+            _diag = _logging.getLogger("sentinel_diag")
+            _diag.warning(
+                "[sentinel诊断] flow=%s, 响应keys=%s, turnstile=%s, proofofwork_required=%s, token_len=%d",
+                flow,
+                list(data.keys()),
+                repr(data.get("turnstile")),
+                (data.get("proofofwork") or {}).get("required"),
+                len(str(data.get("token") or "")),
+            )
+            # ===== 诊断日志结束 =====
+            return data
     except Exception:
         pass
     

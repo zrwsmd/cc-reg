@@ -2357,6 +2357,36 @@ class RegistrationEngine:
             self._log(f"构建注册 Sentinel Token 异常: {e}", "error")
         request_headers.update(generate_datadog_trace())
 
+        # ===== 诊断日志：注册请求完整信息 =====
+        _diag_headers = {k: (v[:80] + "..." if len(str(v)) > 80 else v) for k, v in request_headers.items()}
+        self._log(f"[注册诊断] 请求headers: {_diag_headers}", "warning")
+        try:
+            _cookies = {}
+            for c in self.session.cookies.jar:
+                _cookies[f"{c.name}@{c.domain}"] = (c.value or "")[:40] + ("..." if len(c.value or "") > 40 else "")
+            self._log(f"[注册诊断] session cookies: {_cookies}", "warning")
+        except Exception as _ce:
+            self._log(f"[注册诊断] cookies读取失败: {_ce}", "warning")
+        if fresh_sen_token:
+            try:
+                _st = json.loads(fresh_sen_token)
+                self._log(
+                    f"[注册诊断] sentinel token: flow={_st.get('flow')}, "
+                    f"p_len={len(str(_st.get('p','')))}, "
+                    f"t_len={len(str(_st.get('t','')))}, "
+                    f"t_preview={str(_st.get('t',''))[:60]}, "
+                    f"c_len={len(str(_st.get('c','')))}",
+                    "warning",
+                )
+            except Exception:
+                self._log(f"[注册诊断] sentinel token 解析失败，raw长度={len(fresh_sen_token)}", "warning")
+        else:
+            self._log("[注册诊断] sentinel token 为空！", "warning")
+        # 诊断：curl_cffi impersonate 信息
+        _imp = getattr(self.session, '_impersonate', None) or getattr(self.session, 'impersonate', 'unknown')
+        self._log(f"[注册诊断] curl_cffi impersonate={_imp}, session UA={user_agent[:60] if user_agent else 'N/A'}", "warning")
+        # ===== 诊断日志结束 =====
+
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
@@ -2368,6 +2398,9 @@ class RegistrationEngine:
                 )
 
                 self._log(f"提交密码状态: {response.status_code}")
+                # 诊断：响应头
+                _resp_diag = {k: v for k, v in list(response.headers.items())[:15]}
+                self._log(f"[注册诊断] 响应headers: {_resp_diag}", "warning")
 
                 if response.status_code == 200:
                     return True, password
