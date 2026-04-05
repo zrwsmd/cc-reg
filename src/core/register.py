@@ -2466,6 +2466,30 @@ class RegistrationEngine:
                     )
                     time.sleep(3 if is_transient_400 else 2)
                     continue
+
+                # API 全部失败且是 "failed to create" 400 → 浏览器降级处理 Turnstile
+                if is_transient_400:
+                    self._log("API 注册被风控拦截（疑似 Turnstile），启动浏览器降级...", "warning")
+                    try:
+                        from .openai.browser_register import register_password_via_browser
+                        br = register_password_via_browser(
+                            session=self.session,
+                            password=password,
+                            email=self.email or "",
+                            proxy=self.proxy_url,
+                            device_id=device_id_str,
+                            headless=True,
+                            log_callback=self._log,
+                        )
+                        if br.get("success"):
+                            self._log("浏览器降级注册成功！")
+                            return True, password
+                        self._log(f"浏览器降级失败: stage={br.get('stage')}, error={br.get('error')}", "warning")
+                        self._last_register_password_error = f"API 和浏览器均注册失败: {br.get('error', 'unknown')}"
+                    except Exception as browser_err:
+                        self._log(f"浏览器降级异常: {browser_err}", "warning")
+                        self._last_register_password_error = f"注册密码接口返回异常，浏览器降级也失败: {browser_err}"
+
                 return False, None
 
             except Exception as e:
