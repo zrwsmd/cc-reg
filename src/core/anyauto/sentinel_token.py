@@ -151,8 +151,8 @@ def fetch_sentinel_challenge(session, device_id, flow="authorize_continue", user
         "Content-Type": "text/plain;charset=UTF-8",
         "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
         "Origin": "https://sentinel.openai.com",
-        "User-Agent": user_agent or "Mozilla/5.0",
-        "sec-ch-ua": sec_ch_ua or '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+        "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "sec-ch-ua": sec_ch_ua or '"Chromium";v="136", "Not-A.Brand";v="24", "Google Chrome";v="136"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
     }
@@ -200,8 +200,10 @@ def build_sentinel_token(session, device_id, flow="authorize_continue", user_age
         return None
 
     pow_data = challenge.get("proofofwork") or {}
-    turnstile_data = challenge.get("turnstile") or {}
-    t_value = turnstile_data.get("dx", "") if isinstance(turnstile_data, dict) else ""
+    # turnstile.dx 是 Turnstile 字节码(题目)，需要在浏览器 VM 中执行才能产出有效 token(答案)。
+    # 直接传 dx 字节码(21K字符)会被 OpenAI 识别为无效，比空字符串更糟。
+    # 暂时传空，后续如需有效 Turnstile 解法需引入 Playwright 或 VM。
+    t_value = ""
 
     generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
 
