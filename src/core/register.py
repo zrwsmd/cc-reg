@@ -2316,91 +2316,39 @@ class RegistrationEngine:
                 return False
 
         self._last_register_password_error = None
-        password = self._generate_password()
-        self.password = password
-        self._log(f"生成密码: {password}")
+        device_id_str = str(did or self.device_id or "")
 
-        payload = {
-            "password": password,
-            "username": self.email,
-        }
+        # 对齐 codex-console-1：密码注册只需最精简 headers，
+        # 不发送 sentinel token / oai-device-id / origin / sec-fetch-site / datadog trace。
+        # 多余 headers 反而触发 OpenAI 风控（400 "failed to create"）。
         request_headers = {
             "referer": "https://auth.openai.com/create-account/password",
-            "origin": "https://auth.openai.com",
             "accept": "application/json",
             "content-type": "application/json",
-            "sec-fetch-site": "same-origin",
         }
-        device_id_str = str(did or self.device_id or "")
-        if device_id_str:
-            request_headers["oai-device-id"] = device_id_str
-
-        # Password submission requires a fresh token with flow="register"
-        session_headers = getattr(self.session, "headers", {}) or {}
-        user_agent = str(session_headers.get("User-Agent") or session_headers.get("user-agent") or "").strip()
-        sec_ch_ua = str(session_headers.get("sec-ch-ua") or session_headers.get("Sec-CH-UA") or "").strip()
-        
-        try:
-            from .anyauto.sentinel_token import build_sentinel_token
-            fresh_sen_token = build_sentinel_token(
-                self.session,
-                device_id_str,
-                flow="register",
-                user_agent=user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-                sec_ch_ua=sec_ch_ua or '"Chromium";v="136", "Not-A.Brand";v="24", "Google Chrome";v="136"',
-            )
-            if fresh_sen_token:
-                request_headers["openai-sentinel-token"] = fresh_sen_token
-            else:
-                self._log("生成注册 Sentinel Token 失败，将不带此 header 重试", "warning")
-        except Exception as e:
-            self._log(f"构建注册 Sentinel Token 异常: {e}", "error")
-        request_headers.update(generate_datadog_trace())
-
-        # ===== 诊断日志：注册请求完整信息 =====
-        _diag_headers = {k: (v[:80] + "..." if len(str(v)) > 80 else v) for k, v in request_headers.items()}
-        self._log(f"[注册诊断] 请求headers: {_diag_headers}", "warning")
-        try:
-            _cookies = {}
-            for c in self.session.cookies.jar:
-                _cookies[f"{c.name}@{c.domain}"] = (c.value or "")[:40] + ("..." if len(c.value or "") > 40 else "")
-            self._log(f"[注册诊断] session cookies: {_cookies}", "warning")
-        except Exception as _ce:
-            self._log(f"[注册诊断] cookies读取失败: {_ce}", "warning")
-        if fresh_sen_token:
-            try:
-                _st = json.loads(fresh_sen_token)
-                self._log(
-                    f"[注册诊断] sentinel token: flow={_st.get('flow')}, "
-                    f"p_len={len(str(_st.get('p','')))}, "
-                    f"t_len={len(str(_st.get('t','')))}, "
-                    f"t_preview={str(_st.get('t',''))[:60]}, "
-                    f"c_len={len(str(_st.get('c','')))}",
-                    "warning",
-                )
-            except Exception:
-                self._log(f"[注册诊断] sentinel token 解析失败，raw长度={len(fresh_sen_token)}", "warning")
-        else:
-            self._log("[注册诊断] sentinel token 为空！", "warning")
-        # 诊断：curl_cffi impersonate 信息
-        _imp = getattr(self.session, '_impersonate', None) or getattr(self.session, 'impersonate', 'unknown')
-        self._log(f"[注册诊断] curl_cffi impersonate={_imp}, session UA={user_agent[:60] if user_agent else 'N/A'}", "warning")
-        # ===== 诊断日志结束 =====
 
         max_attempts = 3
+        password = None
         for attempt in range(1, max_attempts + 1):
+            # 每次重试重新生成密码（对齐 codex-console-1 策略）
+            password = self._generate_password()
+            self.password = password
+            self._log(f"生成密码: {password}")
+
+            register_body = json.dumps({
+                "password": password,
+                "username": self.email,
+            })
+
             try:
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["register"],
                     headers=request_headers,
-                    json=payload,
+                    data=register_body,
                     timeout=45,
                 )
 
                 self._log(f"提交密码状态: {response.status_code}")
-                # 诊断：响应头
-                _resp_diag = {k: v for k, v in list(response.headers.items())[:15]}
-                self._log(f"[注册诊断] 响应headers: {_resp_diag}", "warning")
 
                 if response.status_code == 200:
                     return True, password
